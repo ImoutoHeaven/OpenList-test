@@ -11,6 +11,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/search/searcher"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/meilisearch/meilisearch-go"
+	log "github.com/sirupsen/logrus"
 )
 
 type searchDocument struct {
@@ -126,18 +127,22 @@ func (m *Meilisearch) getDocumentsByParent(ctx context.Context, parent string) (
 	query := &meilisearch.DocumentsQuery{
 		Limit: int64(model.MaxInt),
 	}
+	var parentHash string
 	if parent != "" && parent != "/" {
 		// use parent_hash to filter direct children
-		parentHash := hashPath(parent)
+		parentHash = hashPath(parent)
 		query.Filter = fmt.Sprintf("parent_hash = '%s'", parentHash)
 	}
+	log.Debugf("getDocumentsByParent: parent=%s, parentHash=%s, filter=%s", parent, parentHash, query.Filter)
 	err := m.Client.Index(m.IndexUid).GetDocumentsWithContext(ctx, query, &result)
 	if err != nil {
 		return nil, err
 	}
-	return utils.SliceConvert(result.Results, func(src map[string]any) (*searchDocument, error) {
+	docs, _ := utils.SliceConvert(result.Results, func(src map[string]any) (*searchDocument, error) {
 		return buildSearchDocumentFromResults(src), nil
 	})
+	log.Debugf("getDocumentsByParent result: found %d documents", len(docs))
+	return docs, nil
 }
 
 func (m *Meilisearch) Get(ctx context.Context, parent string) ([]model.SearchNode, error) {
@@ -145,9 +150,11 @@ func (m *Meilisearch) Get(ctx context.Context, parent string) ([]model.SearchNod
 	if err != nil {
 		return nil, err
 	}
-	return utils.SliceConvert(result, func(src *searchDocument) (model.SearchNode, error) {
+	nodes, _ := utils.SliceConvert(result, func(src *searchDocument) (model.SearchNode, error) {
 		return src.SearchNode, nil
 	})
+	log.Debugf("Get(%s) returning %d nodes", parent, len(nodes))
+	return nodes, nil
 }
 
 func (m *Meilisearch) getDocumentInPath(ctx context.Context, parent string, name string) (*searchDocument, error) {

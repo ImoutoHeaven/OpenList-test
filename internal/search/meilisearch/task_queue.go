@@ -64,7 +64,11 @@ func (tqm *TaskQueueManager) Enqueue(parent string, objs []model.Obj) {
 		Depth:     calculateDepth(parent),
 		EnqueueAt: time.Now(),
 	}
-	log.Debugf("enqueued update task for parent: %s, depth: %d, objs: %d", parent, calculateDepth(parent), len(objs))
+	var objNames []string
+	for i := range objs {
+		objNames = append(objNames, objs[i].GetName())
+	}
+	log.Debugf("enqueued update task for parent: %s, depth: %d, objs: %d, names: %v", parent, calculateDepth(parent), len(objs), objNames)
 }
 
 // Start starts the task queue consumer
@@ -196,8 +200,15 @@ func (tqm *TaskQueueManager) executeTask(ctx context.Context, task *QueuedTask) 
 		old.Add(nodes[i].Name)
 	}
 
+	// Debug logging
+	log.Debugf("executeTask for parent %s: currentObjs count=%d, indexed nodes count=%d", parent, len(currentObjs), len(nodes))
+	log.Debugf("executeTask currentObjs names: %v", now.ToSlice())
+	log.Debugf("executeTask indexed nodes names: %v", old.ToSlice())
+
 	toDelete := old.Difference(now)
 	toAdd := now.Difference(old)
+
+	log.Debugf("executeTask diff result: toDelete=%v, toAdd=%v", toDelete.ToSlice(), toAdd.ToSlice())
 
 	// Collect paths to delete
 	var pathsToDelete []string
