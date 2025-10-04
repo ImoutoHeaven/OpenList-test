@@ -1,7 +1,6 @@
 package meilisearch
 
 import (
-	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 

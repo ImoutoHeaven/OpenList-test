@@ -66,12 +66,14 @@ func (m *Meilisearch) Search(ctx context.Context, req model.SearchReq) ([]model.
 	}
 	nodes, err := utils.SliceConvert(search.Hits, func(src any) (model.SearchNode, error) {
 		srcMap := src.(map[string]any)
-		return model.SearchNode{
-			Parent: srcMap["parent"].(string),
-			Name:   srcMap["name"].(string),
-			IsDir:  srcMap["is_dir"].(bool),
-			Size:   int64(srcMap["size"].(float64)),
-		}, nil
+		node := model.SearchNode{}
+		node.Parent, _ = srcMap["parent"].(string)
+		node.Name, _ = srcMap["name"].(string)
+		node.IsDir, _ = srcMap["is_dir"].(bool)
+		if size, ok := srcMap["size"].(float64); ok {
+			node.Size = int64(size)
+		}
+		return node, nil
 	})
 	if err != nil {
 		return nil, 0, err
