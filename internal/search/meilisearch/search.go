@@ -207,21 +207,31 @@ func (m *Meilisearch) BatchDelete(ctx context.Context, paths []string) error {
 		return nil
 	}
 
+	// Deduplicate paths first
+	pathSet := make(map[string]struct{})
+	uniquePaths := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = utils.FixAndCleanPath(p)
+		if _, exists := pathSet[p]; !exists {
+			pathSet[p] = struct{}{}
+			uniquePaths = append(uniquePaths, p)
+		}
+	}
+
 	const batchSize = 100 // max paths per batch to avoid filter length limits
 
 	// Process in batches to avoid filter length limits
-	for i := 0; i < len(paths); i += batchSize {
+	for i := 0; i < len(uniquePaths); i += batchSize {
 		end := i + batchSize
-		if end > len(paths) {
-			end = len(paths)
+		if end > len(uniquePaths) {
+			end = len(uniquePaths)
 		}
-		batch := paths[i:end]
+		batch := uniquePaths[i:end]
 
 		// Build combined filter to delete all children in one request
 		// Format: parent_path_hashes = 'hash1' OR parent_path_hashes = 'hash2' OR ...
 		var filters []string
 		for _, p := range batch {
-			p = utils.FixAndCleanPath(p)
 			pathHash := hashPath(p)
 			filters = append(filters, fmt.Sprintf("parent_path_hashes = '%s'", pathHash))
 		}
@@ -237,7 +247,6 @@ func (m *Meilisearch) BatchDelete(ctx context.Context, paths []string) error {
 		// Convert paths to document IDs and batch delete
 		documentIDs := make([]string, 0, len(batch))
 		for _, p := range batch {
-			p = utils.FixAndCleanPath(p)
 			documentIDs = append(documentIDs, hashPath(p))
 		}
 		// Use batch delete API
