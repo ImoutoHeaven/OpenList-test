@@ -25,20 +25,22 @@ type QueuedTask struct {
 
 // TaskQueueManager manages the task queue for async index operations
 type TaskQueueManager struct {
-	queue     map[string]*QueuedTask // parent -> task
-	mu        sync.RWMutex
-	ticker    *time.Ticker
-	stopCh    chan struct{}
-	m         *Meilisearch
-	consuming atomic.Bool // flag to prevent concurrent consumption
+	queue        map[string]*QueuedTask // parent -> task
+	pendingTasks map[string]int64       // parent -> last submitted taskUID
+	mu           sync.RWMutex
+	ticker       *time.Ticker
+	stopCh       chan struct{}
+	m            *Meilisearch
+	consuming    atomic.Bool // flag to prevent concurrent consumption
 }
 
 // NewTaskQueueManager creates a new task queue manager
 func NewTaskQueueManager(m *Meilisearch) *TaskQueueManager {
 	return &TaskQueueManager{
-		queue:  make(map[string]*QueuedTask),
-		stopCh: make(chan struct{}),
-		m:      m,
+		queue:        make(map[string]*QueuedTask),
+		pendingTasks: make(map[string]int64),
+		stopCh:       make(chan struct{}),
+		m:            m,
 	}
 }
 
@@ -130,6 +132,32 @@ func (tqm *TaskQueueManager) consume() {
 
 	// execute tasks in order
 	for _, task := range tasks {
+		// Check if there's a pending task for this parent
+		tqm.mu.RLock()
+		pendingTaskUID, hasPending := tqm.pendingTasks[task.Parent]
+		tqm.mu.RUnlock()
+
+		if hasPending {
+			// Query task status
+			taskStatus, err := tqm.m.getTaskStatus(ctx, pendingTaskUID)
+			if err != nil {
+				log.Errorf("failed to get task status for parent %s (taskUID: %d): %v", task.Parent, pendingTaskUID, err)
+				// If we can't get status, assume it's done and try to execute
+			} else {
+				// Check if task is still running
+				if taskStatus == "enqueued" || taskStatus == "processing" {
+					log.Warnf("skipping task for parent %s: previous task %d still %s", task.Parent, pendingTaskUID, taskStatus)
+					continue // Skip this task
+				}
+				// Task is in terminal state (succeeded/failed/canceled), remove from pending
+				log.Debugf("previous task %d for parent %s is %s, proceeding with new task", pendingTaskUID, task.Parent, taskStatus)
+				tqm.mu.Lock()
+				delete(tqm.pendingTasks, task.Parent)
+				tqm.mu.Unlock()
+			}
+		}
+
+		// Execute the task
 		tqm.executeTask(ctx, task)
 	}
 
@@ -169,13 +197,17 @@ func (tqm *TaskQueueManager) executeTask(ctx context.Context, task *QueuedTask) 
 		}
 	}
 
+	var lastTaskUID int64
+
 	// Execute delete first
 	if len(pathsToDelete) > 0 {
 		log.Debugf("executing delete for parent %s: %d paths", parent, len(pathsToDelete))
-		err = tqm.m.BatchDelete(ctx, pathsToDelete)
+		taskUID, err := tqm.m.batchDeleteWithTaskUID(ctx, pathsToDelete)
 		if err != nil {
 			log.Errorf("failed to batch delete for parent %s: %v", parent, err)
 			// Continue to add even if delete fails
+		} else if taskUID > 0 {
+			lastTaskUID = taskUID
 		}
 	}
 
@@ -196,9 +228,19 @@ func (tqm *TaskQueueManager) executeTask(ctx context.Context, task *QueuedTask) 
 	// Execute add
 	if len(nodesToAdd) > 0 {
 		log.Debugf("executing add for parent %s: %d nodes", parent, len(nodesToAdd))
-		err = tqm.m.BatchIndex(ctx, nodesToAdd)
+		taskUID, err := tqm.m.batchIndexWithTaskUID(ctx, nodesToAdd)
 		if err != nil {
 			log.Errorf("failed to batch index for parent %s: %v", parent, err)
+		} else if taskUID > 0 {
+			lastTaskUID = taskUID
 		}
+	}
+
+	// Record the task UID for this parent
+	if lastTaskUID > 0 {
+		tqm.mu.Lock()
+		tqm.pendingTasks[parent] = lastTaskUID
+		tqm.mu.Unlock()
+		log.Debugf("recorded taskUID %d for parent %s", lastTaskUID, parent)
 	}
 }
