@@ -248,31 +248,18 @@ func Update(parent string, objs []model.Obj) {
 			return
 		}
 	}
-	// collect files to add in batch
+	// collect files and folders to add in batch
 	var toAddObjs []ObjWithParent
 	for i := range objs {
 		if toAdd.Contains(objs[i].GetName()) {
-			if !objs[i].IsDir() {
-				log.Debugf("add index: %s", path.Join(parent, objs[i].GetName()))
-				toAddObjs = append(toAddObjs, ObjWithParent{
-					Parent: parent,
-					Obj:    objs[i],
-				})
-			} else {
-				// build index if it's a folder
-				dir := path.Join(parent, objs[i].GetName())
-				err = BuildIndex(ctx,
-					[]string{dir},
-					conf.SlicesMap[conf.IgnorePaths],
-					setting.GetInt(conf.MaxIndexDepth, 20)-strings.Count(dir, "/"), false)
-				if err != nil {
-					log.Errorf("update search index error while build index: %+v", err)
-					return
-				}
-			}
+			log.Debugf("add index: %s", path.Join(parent, objs[i].GetName()))
+			toAddObjs = append(toAddObjs, ObjWithParent{
+				Parent: parent,
+				Obj:    objs[i],
+			})
 		}
 	}
-	// batch index all files at once
+	// batch index all files and folders at once
 	if len(toAddObjs) > 0 {
 		err = BatchIndex(ctx, toAddObjs)
 		if err != nil {
