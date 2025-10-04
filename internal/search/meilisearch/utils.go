@@ -13,19 +13,27 @@ func hashPath(path string) string {
 }
 
 func buildSearchDocumentFromResults(results map[string]any) *searchDocument {
-	searchNode := model.SearchNode{}
-	document := &searchDocument{
-		SearchNode: searchNode,
-	}
+	document := &searchDocument{}
 
 	// use assertion test to avoid panic
-	searchNode.Parent, _ = results["parent"].(string)
-	searchNode.Name, _ = results["name"].(string)
-	searchNode.IsDir, _ = results["is_dir"].(bool)
-	searchNode.Size, _ = results["size"].(int64)
+	document.SearchNode.Parent, _ = results["parent"].(string)
+	document.SearchNode.Name, _ = results["name"].(string)
+	document.SearchNode.IsDir, _ = results["is_dir"].(bool)
+	// JSON numbers are typically float64, not int64
+	if size, ok := results["size"].(float64); ok {
+		document.SearchNode.Size = int64(size)
+	}
 
 	document.ID, _ = results["id"].(string)
 	document.ParentHash, _ = results["parent_hash"].(string)
-	document.ParentPathHashes, _ = results["parent_path_hashes"].([]string)
+	// JSON arrays need proper type assertion
+	if hashes, ok := results["parent_path_hashes"].([]any); ok {
+		document.ParentPathHashes = make([]string, 0, len(hashes))
+		for _, h := range hashes {
+			if hash, ok := h.(string); ok {
+				document.ParentPathHashes = append(document.ParentPathHashes, hash)
+			}
+		}
+	}
 	return document
 }
