@@ -202,6 +202,54 @@ func (m *Meilisearch) Del(ctx context.Context, prefix string) error {
 	return err
 }
 
+func (m *Meilisearch) BatchDelete(ctx context.Context, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+
+	const batchSize = 100 // max paths per batch to avoid filter length limits
+
+	// Process in batches to avoid filter length limits
+	for i := 0; i < len(paths); i += batchSize {
+		end := i + batchSize
+		if end > len(paths) {
+			end = len(paths)
+		}
+		batch := paths[i:end]
+
+		// Build combined filter to delete all children in one request
+		// Format: parent_path_hashes = 'hash1' OR parent_path_hashes = 'hash2' OR ...
+		var filters []string
+		for _, p := range batch {
+			p = utils.FixAndCleanPath(p)
+			pathHash := hashPath(p)
+			filters = append(filters, fmt.Sprintf("parent_path_hashes = '%s'", pathHash))
+		}
+		if len(filters) > 0 {
+			combinedFilter := strings.Join(filters, " OR ")
+			// Delete all children for all paths in one request
+			_, err := m.Client.Index(m.IndexUid).DeleteDocumentsByFilterWithContext(ctx, combinedFilter)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Convert paths to document IDs and batch delete
+		documentIDs := make([]string, 0, len(batch))
+		for _, p := range batch {
+			p = utils.FixAndCleanPath(p)
+			documentIDs = append(documentIDs, hashPath(p))
+		}
+		// Use batch delete API
+		_, err := m.Client.Index(m.IndexUid).DeleteDocumentsWithContext(ctx, documentIDs)
+		if err != nil {
+			return err
+		}
+		// task was enqueued (if succeed), no need to wait
+	}
+	return nil
+}
+
 func (m *Meilisearch) Release(ctx context.Context) error {
 	return nil
 }

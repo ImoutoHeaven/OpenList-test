@@ -232,14 +232,20 @@ func Update(parent string, objs []model.Obj) {
 	// delete data that no longer exists
 	toDelete := old.Difference(now)
 	toAdd := now.Difference(old)
+	// collect paths to delete
+	var pathsToDelete []string
 	for i := range nodes {
 		if toDelete.Contains(nodes[i].Name) && !op.HasStorage(path.Join(parent, nodes[i].Name)) {
-			log.Debugf("delete index: %s", path.Join(parent, nodes[i].Name))
-			err = instance.Del(ctx, path.Join(parent, nodes[i].Name))
-			if err != nil {
-				log.Errorf("update search index error while del old node: %+v", err)
-				return
-			}
+			pathsToDelete = append(pathsToDelete, path.Join(parent, nodes[i].Name))
+		}
+	}
+	// batch delete
+	if len(pathsToDelete) > 0 {
+		log.Debugf("batch delete %d indexes", len(pathsToDelete))
+		err = instance.BatchDelete(ctx, pathsToDelete)
+		if err != nil {
+			log.Errorf("update search index error while batch delete old nodes: %+v", err)
+			return
 		}
 	}
 	// collect files to add in batch

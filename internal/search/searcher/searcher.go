@@ -24,6 +24,8 @@ type Searcher interface {
 	Get(ctx context.Context, parent string) ([]model.SearchNode, error)
 	// Del with prefix
 	Del(ctx context.Context, prefix string) error
+	// BatchDelete with multiple paths
+	BatchDelete(ctx context.Context, paths []string) error
 	// Release resource
 	Release(ctx context.Context) error
 	// Clear all index

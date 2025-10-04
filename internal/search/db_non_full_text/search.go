@@ -34,6 +34,15 @@ func (D DB) Del(ctx context.Context, path string) error {
 	return db.DeleteSearchNodesByParent(path)
 }
 
+func (D DB) BatchDelete(ctx context.Context, paths []string) error {
+	for _, path := range paths {
+		if err := D.Del(ctx, path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (D DB) Release(ctx context.Context) error {
 	return nil
 }
