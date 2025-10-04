@@ -77,6 +77,10 @@ func (b *Bleve) Del(ctx context.Context, prefix string) error {
 	return errs.NotSupport
 }
 
+func (b *Bleve) BatchDelete(ctx context.Context, paths []string) error {
+	return errs.NotSupport
+}
+
 func (b *Bleve) Release(ctx context.Context) error {
 	if b.BIndex != nil {
 		return b.BIndex.Close()
