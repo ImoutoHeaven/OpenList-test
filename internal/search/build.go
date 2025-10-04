@@ -242,15 +242,16 @@ func Update(parent string, objs []model.Obj) {
 			}
 		}
 	}
+	// collect files to add in batch
+	var toAddObjs []ObjWithParent
 	for i := range objs {
 		if toAdd.Contains(objs[i].GetName()) {
 			if !objs[i].IsDir() {
 				log.Debugf("add index: %s", path.Join(parent, objs[i].GetName()))
-				err = Index(ctx, parent, objs[i])
-				if err != nil {
-					log.Errorf("update search index error while index new node: %+v", err)
-					return
-				}
+				toAddObjs = append(toAddObjs, ObjWithParent{
+					Parent: parent,
+					Obj:    objs[i],
+				})
 			} else {
 				// build index if it's a folder
 				dir := path.Join(parent, objs[i].GetName())
@@ -263,6 +264,14 @@ func Update(parent string, objs []model.Obj) {
 					return
 				}
 			}
+		}
+	}
+	// batch index all files at once
+	if len(toAddObjs) > 0 {
+		err = BatchIndex(ctx, toAddObjs)
+		if err != nil {
+			log.Errorf("update search index error while batch index new nodes: %+v", err)
+			return
 		}
 	}
 }
