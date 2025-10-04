@@ -287,10 +287,10 @@ func (m *Meilisearch) EnqueueUpdate(parent string, objs []model.Obj) {
 	m.taskQueue.Enqueue(parent, objs)
 }
 
-// batchIndexWithTaskUID indexes documents and returns the last taskUID
-func (m *Meilisearch) batchIndexWithTaskUID(ctx context.Context, nodes []model.SearchNode) (int64, error) {
+// batchIndexWithTaskUID indexes documents and returns all taskUIDs
+func (m *Meilisearch) batchIndexWithTaskUID(ctx context.Context, nodes []model.SearchNode) ([]int64, error) {
 	if len(nodes) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 
 	documents, _ := utils.SliceConvert(nodes, func(src model.SearchNode) (*searchDocument, error) {
@@ -313,20 +313,21 @@ func (m *Meilisearch) batchIndexWithTaskUID(ctx context.Context, nodes []model.S
 	// max up to 10,000 documents per batch to reduce error rate while uploading over the Internet
 	tasks, err := m.Client.Index(m.IndexUid).AddDocumentsInBatchesWithContext(ctx, documents, 10000)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	// Return the last task UID (most recent operation)
-	if len(tasks) > 0 {
-		return tasks[len(tasks)-1].TaskUID, nil
+	// Return all task UIDs
+	taskUIDs := make([]int64, 0, len(tasks))
+	for _, task := range tasks {
+		taskUIDs = append(taskUIDs, task.TaskUID)
 	}
-	return 0, nil
+	return taskUIDs, nil
 }
 
-// batchDeleteWithTaskUID deletes documents and returns the last taskUID
-func (m *Meilisearch) batchDeleteWithTaskUID(ctx context.Context, paths []string) (int64, error) {
+// batchDeleteWithTaskUID deletes documents and returns all taskUIDs
+func (m *Meilisearch) batchDeleteWithTaskUID(ctx context.Context, paths []string) ([]int64, error) {
 	if len(paths) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 
 	// Deduplicate paths first
@@ -341,7 +342,7 @@ func (m *Meilisearch) batchDeleteWithTaskUID(ctx context.Context, paths []string
 	}
 
 	const batchSize = 100 // max paths per batch to avoid filter length limits
-	var lastTaskUID int64
+	var taskUIDs []int64
 
 	// Process in batches to avoid filter length limits
 	for i := 0; i < len(uniquePaths); i += batchSize {
@@ -363,9 +364,9 @@ func (m *Meilisearch) batchDeleteWithTaskUID(ctx context.Context, paths []string
 			// Delete all children for all paths in one request
 			task, err := m.Client.Index(m.IndexUid).DeleteDocumentsByFilterWithContext(ctx, combinedFilter)
 			if err != nil {
-				return 0, err
+				return nil, err
 			}
-			lastTaskUID = task.TaskUID
+			taskUIDs = append(taskUIDs, task.TaskUID)
 		}
 
 		// Convert paths to document IDs and batch delete
@@ -376,9 +377,9 @@ func (m *Meilisearch) batchDeleteWithTaskUID(ctx context.Context, paths []string
 		// Use batch delete API
 		task, err := m.Client.Index(m.IndexUid).DeleteDocumentsWithContext(ctx, documentIDs)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
-		lastTaskUID = task.TaskUID
+		taskUIDs = append(taskUIDs, task.TaskUID)
 	}
-	return lastTaskUID, nil
+	return taskUIDs, nil
 }
