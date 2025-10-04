@@ -33,6 +33,7 @@ type Meilisearch struct {
 	IndexUid             string
 	FilterableAttributes []string
 	SearchableAttributes []string
+	taskQueue            *TaskQueueManager
 }
 
 func (m *Meilisearch) Config() searcher.Config {
@@ -275,4 +276,13 @@ func (m *Meilisearch) getTaskStatus(ctx context.Context, taskUID int64) (meilise
 		return meilisearch.TaskStatusUnknown, err
 	}
 	return forTask.Status, nil
+}
+
+// EnqueueUpdate enqueues an update task to the task queue
+func (m *Meilisearch) EnqueueUpdate(parent string, objs []model.Obj) {
+	if m.taskQueue == nil {
+		return
+	}
+
+	m.taskQueue.Enqueue(parent, objs)
 }

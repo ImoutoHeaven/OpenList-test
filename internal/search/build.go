@@ -206,7 +206,6 @@ func Update(parent string, objs []model.Obj) {
 	if isIgnorePath(parent) {
 		return
 	}
-	ctx := context.Background()
 	// only update when index have built
 	progress, err := Progress()
 	if err != nil {
@@ -216,6 +215,18 @@ func Update(parent string, objs []model.Obj) {
 	if !progress.IsDone {
 		return
 	}
+
+	// Use task queue for Meilisearch to avoid race conditions with async indexing
+	if msInstance, ok := instance.(interface {
+		EnqueueUpdate(parent string, objs []model.Obj)
+	}); ok {
+		// Enqueue task for async processing (diff calculation happens at consumption time)
+		msInstance.EnqueueUpdate(parent, objs)
+		return
+	}
+
+	// For other searchers (db, bleve), execute immediately with sync logic
+	ctx := context.Background()
 	nodes, err := instance.Get(ctx, parent)
 	if err != nil {
 		log.Errorf("update search index error while get nodes: %+v", err)
