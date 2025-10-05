@@ -199,6 +199,12 @@ func (tqm *TaskQueueManager) executeTask(ctx context.Context, task *QueuedTask) 
 		return
 	}
 
+	// Safety check: prevent deletion when index has content but currentObjs is empty
+	if len(nodes) > 0 && len(currentObjs) == 0 {
+		log.Warnf("Safety guard triggered: parent=%s has %d indexed nodes but currentObjs is empty (possible throttling or error), skipping update", parent, len(nodes))
+		return
+	}
+
 	// Calculate diff based on current index state
 	now := mapset.NewSet[string]()
 	for i := range currentObjs {
