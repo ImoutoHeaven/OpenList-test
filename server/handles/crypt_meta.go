@@ -9,6 +9,7 @@ import (
 	driverCrypt "github.com/OpenListTeam/OpenList/v4/drivers/crypt"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
@@ -94,7 +95,16 @@ func CryptMeta(c *gin.Context) {
 		Header: c.Request.Header.Clone(),
 	}
 
-	remoteLink, remoteObj, err := cryptDriver.RemoteLink(c.Request.Context(), cleanPath, linkArgs)
+	relativePath := strings.TrimPrefix(cleanPath, storage.GetStorage().MountPath)
+	relativePath = strings.TrimPrefix(relativePath, "/")
+
+	encryptedPath := cryptDriver.EncryptedPath(relativePath, false)
+	remoteStorage, remoteActualPath, err := op.GetStorageAndActualPath(encryptedPath)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError)
+		return
+	}
+	remoteLink, remoteObj, err := op.Link(c.Request.Context(), remoteStorage, remoteActualPath, linkArgs)
 	if err != nil {
 		common.ErrorResp(c, err, http.StatusInternalServerError)
 		return
@@ -113,11 +123,7 @@ func CryptMeta(c *gin.Context) {
 		headerMap[k] = strings.Join(v, ",")
 	}
 
-	actualPath, err := cryptDriver.EncryptedActualPath(cleanPath, false)
-	if err != nil {
-		common.ErrorResp(c, err, http.StatusInternalServerError)
-		return
-	}
+	actualPath := remoteActualPath
 
 	resp := cryptMetaResponse{
 		Path:                cleanPath,
@@ -129,7 +135,7 @@ func CryptMeta(c *gin.Context) {
 		BlockHeaderSize:     driverCrypt.DataBlockHeaderSize,
 		DataKey:             base64.StdEncoding.EncodeToString(dataKey),
 		EncryptedSuffix:     cryptDriver.EncryptedSuffix,
-		EncryptedPath:       cryptDriver.EncryptedPath(cleanPath, false),
+		EncryptedPath:       encryptedPath,
 		EncryptedActualPath: actualPath,
 		Remote: cryptRemoteInfo{
 			URL:         remoteLink.URL,
