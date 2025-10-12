@@ -21,6 +21,7 @@ type cryptRemoteInfo struct {
 	Headers     map[string]string `json:"headers,omitempty"`
 	Concurrency int               `json:"concurrency,omitempty"`
 	PartSize    int               `json:"part_size,omitempty"`
+	RawPath     string            `json:"raw_path,omitempty"`
 }
 
 type cryptMetaResponse struct {
@@ -143,6 +144,7 @@ func CryptMeta(c *gin.Context) {
 			Headers:     headerMap,
 			Concurrency: remoteLink.Concurrency,
 			PartSize:    remoteLink.PartSize,
+			RawPath:     actualPath,
 		},
 	}
 
