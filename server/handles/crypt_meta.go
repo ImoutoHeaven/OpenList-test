@@ -3,11 +3,13 @@ package handles
 import (
 	"encoding/base64"
 	"net/http"
+	stdpath "path"
 	"strings"
 
 	driverCrypt "github.com/OpenListTeam/OpenList/v4/drivers/crypt"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
 )
@@ -53,9 +55,27 @@ func CryptMeta(c *gin.Context) {
 		return
 	}
 
-	obj, err := fs.Get(c.Request.Context(), req.Path, &fs.GetArgs{})
+	cleanPath := utils.FixAndCleanPath(req.Path)
+	dirPath := stdpath.Dir(cleanPath)
+	if dirPath == "." {
+		dirPath = "/"
+	}
+	fileName := stdpath.Base(cleanPath)
+	listEntries, err := fs.List(c.Request.Context(), dirPath, &fs.ListArgs{})
 	if err != nil {
 		common.ErrorResp(c, err, http.StatusInternalServerError)
+		return
+	}
+
+	var obj model.Obj
+	for _, entry := range listEntries {
+		if entry.GetName() == fileName {
+			obj = entry
+			break
+		}
+	}
+	if obj == nil {
+		common.ErrorStrResp(c, "object not found", http.StatusNotFound)
 		return
 	}
 	if obj.IsDir() {
@@ -74,7 +94,7 @@ func CryptMeta(c *gin.Context) {
 		Header: c.Request.Header.Clone(),
 	}
 
-	remoteLink, remoteObj, err := cryptDriver.RemoteLink(c.Request.Context(), req.Path, linkArgs)
+	remoteLink, remoteObj, err := cryptDriver.RemoteLink(c.Request.Context(), cleanPath, linkArgs)
 	if err != nil {
 		common.ErrorResp(c, err, http.StatusInternalServerError)
 		return
@@ -93,14 +113,14 @@ func CryptMeta(c *gin.Context) {
 		headerMap[k] = strings.Join(v, ",")
 	}
 
-	actualPath, err := cryptDriver.EncryptedActualPath(req.Path, false)
+	actualPath, err := cryptDriver.EncryptedActualPath(cleanPath, false)
 	if err != nil {
 		common.ErrorResp(c, err, http.StatusInternalServerError)
 		return
 	}
 
 	resp := cryptMetaResponse{
-		Path:                req.Path,
+		Path:                cleanPath,
 		FileName:            obj.GetName(),
 		Size:                obj.GetSize(),
 		EncryptedSize:       encryptedSize,
@@ -109,7 +129,7 @@ func CryptMeta(c *gin.Context) {
 		BlockHeaderSize:     driverCrypt.DataBlockHeaderSize,
 		DataKey:             base64.StdEncoding.EncodeToString(dataKey),
 		EncryptedSuffix:     cryptDriver.EncryptedSuffix,
-		EncryptedPath:       cryptDriver.EncryptedPath(req.Path, false),
+		EncryptedPath:       cryptDriver.EncryptedPath(cleanPath, false),
 		EncryptedActualPath: actualPath,
 		Remote: cryptRemoteInfo{
 			URL:         remoteLink.URL,
