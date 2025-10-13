@@ -7,9 +7,12 @@ import (
 	"strings"
 
 	driverCrypt "github.com/OpenListTeam/OpenList/v4/drivers/crypt"
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/setting"
+	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
@@ -112,6 +115,20 @@ func CryptMeta(c *gin.Context) {
 	}
 	defer remoteLink.Close()
 
+	useProxy := false
+	remoteURL := remoteLink.URL
+	if proxyURL := common.GenerateDownProxyURL(remoteStorage.GetStorage(), encryptedPath); proxyURL != "" {
+		useProxy = true
+		remoteURL = proxyURL
+	} else if remoteStorage.Config().MustProxy() || remoteStorage.GetStorage().WebProxy {
+		useProxy = true
+		proxyURL := common.GetApiUrl(c) + "/p" + utils.EncodePath(encryptedPath, true)
+		if common.IsStorageSignEnabled(encryptedPath) || setting.GetBool(conf.SignAll) {
+			proxyURL += "?sign=" + sign.Sign(encryptedPath)
+		}
+		remoteURL = proxyURL
+	}
+
 	var encryptedSize int64
 	if remoteLink.ContentLength > 0 {
 		encryptedSize = remoteLink.ContentLength
@@ -119,12 +136,21 @@ func CryptMeta(c *gin.Context) {
 		encryptedSize = remoteObj.GetSize()
 	}
 
-	headerMap := make(map[string]string, len(remoteLink.Header))
-	for k, v := range remoteLink.Header {
-		headerMap[k] = strings.Join(v, ",")
+	var headerMap map[string]string
+	if !useProxy {
+		headerMap = make(map[string]string, len(remoteLink.Header))
+		for k, v := range remoteLink.Header {
+			headerMap[k] = strings.Join(v, ",")
+		}
 	}
 
 	actualPath := remoteActualPath
+	concurrency := remoteLink.Concurrency
+	partSize := remoteLink.PartSize
+	if useProxy {
+		concurrency = 0
+		partSize = 0
+	}
 
 	resp := cryptMetaResponse{
 		Path:                cleanPath,
@@ -139,11 +165,11 @@ func CryptMeta(c *gin.Context) {
 		EncryptedPath:       encryptedPath,
 		EncryptedActualPath: actualPath,
 		Remote: cryptRemoteInfo{
-			URL:         remoteLink.URL,
+			URL:         remoteURL,
 			Method:      http.MethodGet,
 			Headers:     headerMap,
-			Concurrency: remoteLink.Concurrency,
-			PartSize:    remoteLink.PartSize,
+			Concurrency: concurrency,
+			PartSize:    partSize,
 			RawPath:     actualPath,
 		},
 	}
