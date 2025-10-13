@@ -16,6 +16,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
 )
 
 type cryptRemoteInfo struct {
@@ -105,12 +106,12 @@ func CryptMeta(c *gin.Context) {
 	encryptedPath := cryptDriver.EncryptedPath(relativePath, false)
 	remoteStorage, remoteActualPath, err := op.GetStorageAndActualPath(encryptedPath)
 	if err != nil {
-		common.ErrorResp(c, err, http.StatusInternalServerError)
+		common.ErrorResp(c, errors.Wrapf(err, "failed to locate remote storage for %s", encryptedPath), http.StatusInternalServerError)
 		return
 	}
 	remoteLink, remoteObj, err := op.Link(c.Request.Context(), remoteStorage, remoteActualPath, linkArgs)
 	if err != nil {
-		common.ErrorResp(c, err, http.StatusInternalServerError)
+		common.ErrorResp(c, errors.Wrapf(err, "failed to get remote link for %s", remoteActualPath), http.StatusInternalServerError)
 		return
 	}
 	defer remoteLink.Close()
