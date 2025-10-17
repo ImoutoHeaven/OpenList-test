@@ -119,7 +119,6 @@ func CryptMeta(c *gin.Context) {
 		blockDataSize = driverCrypt.DataBlockSize
 		blockHeaderSize = driverCrypt.DataBlockHeaderSize
 		encryptedSuffix = cryptDriver.EncryptedSuffix
-		var err error
 		remoteStorage, remoteActualPath, err = op.GetStorageAndActualPath(requestPath)
 		if err != nil {
 			common.ErrorResp(c, errors.Wrapf(err, "failed to locate remote storage for %s", requestPath), http.StatusInternalServerError)
@@ -129,7 +128,6 @@ func CryptMeta(c *gin.Context) {
 		encryptionActual = remoteActualPath
 	} else {
 		requestPath = cleanPath
-		var err error
 		remoteStorage, remoteActualPath, err = op.GetStorageAndActualPath(requestPath)
 		if err != nil {
 			common.ErrorResp(c, errors.Wrapf(err, "failed to locate storage for %s", requestPath), http.StatusInternalServerError)
