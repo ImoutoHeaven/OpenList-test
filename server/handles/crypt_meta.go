@@ -45,6 +45,76 @@ type cryptMetaResponse struct {
 	Remote              cryptRemoteInfo `json:"remote"`
 }
 
+type storageChainNode struct {
+	storage    driver.Driver
+	rawPath    string
+	actualPath string
+}
+
+type aliasPathResolver interface {
+	ResolveRawPaths(path string) []string
+}
+
+func buildStorageChain(rawPath string) ([]storageChainNode, error) {
+	const maxDepth = 16
+	cleaned := utils.FixAndCleanPath(rawPath)
+	nodes := make([]storageChainNode, 0, 4)
+	currentRawPath := cleaned
+	visited := make(map[string]struct{})
+
+	for depth := 0; depth < maxDepth; depth++ {
+		storage, actualPath, err := op.GetStorageAndActualPath(currentRawPath)
+		if err != nil {
+			return nil, err
+		}
+		key := storage.GetStorage().MountPath + ":" + actualPath
+		if _, ok := visited[key]; ok {
+			break
+		}
+		visited[key] = struct{}{}
+		nodes = append(nodes, storageChainNode{
+			storage:    storage,
+			rawPath:    currentRawPath,
+			actualPath: actualPath,
+		})
+
+		resolver, ok := storage.(aliasPathResolver)
+		if !ok {
+			break
+		}
+		candidates := resolver.ResolveRawPaths(actualPath)
+		if len(candidates) == 0 {
+			break
+		}
+		next := utils.FixAndCleanPath(candidates[0])
+		if next == currentRawPath {
+			break
+		}
+		currentRawPath = next
+	}
+
+	return nodes, nil
+}
+
+func pickNestedProxyURL(nodes []storageChainNode) string {
+	if len(nodes) == 0 {
+		return ""
+	}
+	candidates := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		if url := common.GenerateDownProxyURL(node.storage.GetStorage(), node.rawPath); url != "" {
+			candidates = append(candidates, url)
+		}
+	}
+	if len(candidates) >= 2 {
+		return candidates[1]
+	}
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+	return ""
+}
+
 func CryptMeta(c *gin.Context) {
 	var req MkdirOrLinkReq
 	if err := c.ShouldBind(&req); err != nil {
@@ -104,6 +174,8 @@ func CryptMeta(c *gin.Context) {
 		encryptionActual string
 	)
 
+	var storageChain []storageChainNode
+
 	if cryptDriver, ok := storage.(*driverCrypt.Crypt); ok {
 		mode = "crypt"
 		dataKey, err := cryptDriver.DataKey()
@@ -124,6 +196,16 @@ func CryptMeta(c *gin.Context) {
 			common.ErrorResp(c, errors.Wrapf(err, "failed to locate remote storage for %s", requestPath), http.StatusInternalServerError)
 			return
 		}
+		storageChain, err = buildStorageChain(requestPath)
+		if err != nil {
+			common.ErrorResp(c, errors.Wrapf(err, "failed to resolve storage chain for %s", requestPath), http.StatusInternalServerError)
+			return
+		}
+		if len(storageChain) > 0 {
+			last := storageChain[len(storageChain)-1]
+			remoteStorage = last.storage
+			remoteActualPath = last.actualPath
+		}
 		encryptionPath = requestPath
 		encryptionActual = remoteActualPath
 	} else {
@@ -132,6 +214,16 @@ func CryptMeta(c *gin.Context) {
 		if err != nil {
 			common.ErrorResp(c, errors.Wrapf(err, "failed to locate storage for %s", requestPath), http.StatusInternalServerError)
 			return
+		}
+		storageChain, err = buildStorageChain(requestPath)
+		if err != nil {
+			common.ErrorResp(c, errors.Wrapf(err, "failed to resolve storage chain for %s", requestPath), http.StatusInternalServerError)
+			return
+		}
+		if len(storageChain) > 0 {
+			last := storageChain[len(storageChain)-1]
+			remoteStorage = last.storage
+			remoteActualPath = last.actualPath
 		}
 		encryptionPath = requestPath
 		encryptionActual = remoteActualPath
@@ -146,7 +238,11 @@ func CryptMeta(c *gin.Context) {
 
 	useProxy := false
 	remoteURL := remoteLink.URL
-	if proxyURL := common.GenerateDownProxyURL(remoteStorage.GetStorage(), encryptionPath); proxyURL != "" {
+	selectedProxy := pickNestedProxyURL(storageChain)
+	if selectedProxy != "" {
+		useProxy = true
+		remoteURL = selectedProxy
+	} else if proxyURL := common.GenerateDownProxyURL(remoteStorage.GetStorage(), encryptionPath); proxyURL != "" {
 		useProxy = true
 		remoteURL = proxyURL
 	} else if remoteStorage.Config().MustProxy() || remoteStorage.GetStorage().WebProxy {

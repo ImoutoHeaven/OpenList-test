@@ -220,6 +220,20 @@ func (d *Alias) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (
 	return nil, errs.ObjectNotFound
 }
 
+// ResolveRawPaths returns all candidate raw paths mapped from the provided alias path.
+func (d *Alias) ResolveRawPaths(path string) []string {
+	root, sub := d.getRootAndPath(path)
+	dsts, ok := d.pathMap[root]
+	if !ok || len(dsts) == 0 {
+		return nil
+	}
+	res := make([]string, 0, len(dsts))
+	for _, dst := range dsts {
+		res = append(res, stdpath.Join(dst, sub))
+	}
+	return res
+}
+
 func (d *Alias) Other(ctx context.Context, args model.OtherArgs) (interface{}, error) {
 	root, sub := d.getRootAndPath(args.Obj.GetPath())
 	dsts, ok := d.pathMap[root]
