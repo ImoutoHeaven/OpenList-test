@@ -8,6 +8,7 @@ import (
 
 	driverCrypt "github.com/OpenListTeam/OpenList/v4/drivers/crypt"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
@@ -29,6 +30,7 @@ type cryptRemoteInfo struct {
 }
 
 type cryptMetaResponse struct {
+	Mode                string          `json:"mode"`
 	Path                string          `json:"path"`
 	FileName            string          `json:"file_name"`
 	Size                int64           `json:"size"`
@@ -52,12 +54,6 @@ func CryptMeta(c *gin.Context) {
 	storage, err := fs.GetStorage(req.Path, &fs.GetStoragesArgs{})
 	if err != nil {
 		common.ErrorResp(c, err, http.StatusInternalServerError)
-		return
-	}
-
-	cryptDriver, ok := storage.(*driverCrypt.Crypt)
-	if !ok {
-		common.ErrorStrResp(c, "storage is not crypt", http.StatusBadRequest)
 		return
 	}
 
@@ -89,26 +85,60 @@ func CryptMeta(c *gin.Context) {
 		return
 	}
 
-	dataKey, err := cryptDriver.DataKey()
-	if err != nil {
-		common.ErrorResp(c, err, http.StatusInternalServerError)
-		return
-	}
-
 	linkArgs := model.LinkArgs{
 		IP:     c.ClientIP(),
 		Header: c.Request.Header.Clone(),
 	}
 
-	relativePath := strings.TrimPrefix(cleanPath, storage.GetStorage().MountPath)
-	relativePath = strings.TrimPrefix(relativePath, "/")
+	mode := "plain"
+	var (
+		fileHeaderSize   int
+		blockDataSize    int
+		blockHeaderSize  int
+		dataKeyEncoded   string
+		encryptedSuffix  string
+		requestPath      string
+		remoteStorage    driver.Driver
+		remoteActualPath string
+		encryptionPath   string
+		encryptionActual string
+	)
 
-	encryptedPath := cryptDriver.EncryptedPath(relativePath, false)
-	remoteStorage, remoteActualPath, err := op.GetStorageAndActualPath(encryptedPath)
-	if err != nil {
-		common.ErrorResp(c, errors.Wrapf(err, "failed to locate remote storage for %s", encryptedPath), http.StatusInternalServerError)
-		return
+	if cryptDriver, ok := storage.(*driverCrypt.Crypt); ok {
+		mode = "crypt"
+		dataKey, err := cryptDriver.DataKey()
+		if err != nil {
+			common.ErrorResp(c, err, http.StatusInternalServerError)
+			return
+		}
+		dataKeyEncoded = base64.StdEncoding.EncodeToString(dataKey)
+		relativePath := strings.TrimPrefix(cleanPath, storage.GetStorage().MountPath)
+		relativePath = strings.TrimPrefix(relativePath, "/")
+		requestPath = cryptDriver.EncryptedPath(relativePath, false)
+		fileHeaderSize = driverCrypt.FileHeaderSize
+		blockDataSize = driverCrypt.DataBlockSize
+		blockHeaderSize = driverCrypt.DataBlockHeaderSize
+		encryptedSuffix = cryptDriver.EncryptedSuffix
+		var err error
+		remoteStorage, remoteActualPath, err = op.GetStorageAndActualPath(requestPath)
+		if err != nil {
+			common.ErrorResp(c, errors.Wrapf(err, "failed to locate remote storage for %s", requestPath), http.StatusInternalServerError)
+			return
+		}
+		encryptionPath = requestPath
+		encryptionActual = remoteActualPath
+	} else {
+		requestPath = cleanPath
+		var err error
+		remoteStorage, remoteActualPath, err = op.GetStorageAndActualPath(requestPath)
+		if err != nil {
+			common.ErrorResp(c, errors.Wrapf(err, "failed to locate storage for %s", requestPath), http.StatusInternalServerError)
+			return
+		}
+		encryptionPath = requestPath
+		encryptionActual = remoteActualPath
 	}
+
 	remoteLink, remoteObj, err := op.Link(c.Request.Context(), remoteStorage, remoteActualPath, linkArgs)
 	if err != nil {
 		common.ErrorResp(c, errors.Wrapf(err, "failed to get remote link for %s", remoteActualPath), http.StatusInternalServerError)
@@ -118,14 +148,14 @@ func CryptMeta(c *gin.Context) {
 
 	useProxy := false
 	remoteURL := remoteLink.URL
-	if proxyURL := common.GenerateDownProxyURL(remoteStorage.GetStorage(), encryptedPath); proxyURL != "" {
+	if proxyURL := common.GenerateDownProxyURL(remoteStorage.GetStorage(), encryptionPath); proxyURL != "" {
 		useProxy = true
 		remoteURL = proxyURL
 	} else if remoteStorage.Config().MustProxy() || remoteStorage.GetStorage().WebProxy {
 		useProxy = true
-		proxyURL := common.GetApiUrl(c) + "/p" + utils.EncodePath(encryptedPath, true)
-		if common.IsStorageSignEnabled(encryptedPath) || setting.GetBool(conf.SignAll) {
-			proxyURL += "?sign=" + sign.Sign(encryptedPath)
+		proxyURL := common.GetApiUrl(c) + "/p" + utils.EncodePath(encryptionPath, true)
+		if common.IsStorageSignEnabled(encryptionPath) || setting.GetBool(conf.SignAll) {
+			proxyURL += "?sign=" + sign.Sign(encryptionPath)
 		}
 		remoteURL = proxyURL
 	}
@@ -151,20 +181,23 @@ func CryptMeta(c *gin.Context) {
 	if useProxy {
 		concurrency = 0
 		partSize = 0
+	} else if concurrency > 16 {
+		concurrency = 16
 	}
 
 	resp := cryptMetaResponse{
+		Mode:                mode,
 		Path:                cleanPath,
 		FileName:            obj.GetName(),
 		Size:                obj.GetSize(),
 		EncryptedSize:       encryptedSize,
-		FileHeaderSize:      driverCrypt.FileHeaderSize,
-		BlockDataSize:       driverCrypt.DataBlockSize,
-		BlockHeaderSize:     driverCrypt.DataBlockHeaderSize,
-		DataKey:             base64.StdEncoding.EncodeToString(dataKey),
-		EncryptedSuffix:     cryptDriver.EncryptedSuffix,
-		EncryptedPath:       encryptedPath,
-		EncryptedActualPath: actualPath,
+		FileHeaderSize:      fileHeaderSize,
+		BlockDataSize:       blockDataSize,
+		BlockHeaderSize:     blockHeaderSize,
+		DataKey:             dataKeyEncoded,
+		EncryptedSuffix:     encryptedSuffix,
+		EncryptedPath:       encryptionPath,
+		EncryptedActualPath: encryptionActual,
 		Remote: cryptRemoteInfo{
 			URL:         remoteURL,
 			Method:      http.MethodGet,
