@@ -249,7 +249,10 @@ func CryptMeta(c *gin.Context) {
 		useProxy = true
 		proxyURL := common.GetApiUrl(c) + "/p" + utils.EncodePath(encryptionPath, true)
 		if common.IsStorageSignEnabled(encryptionPath) || setting.GetBool(conf.SignAll) {
-			proxyURL += "?sign=" + sign.Sign(encryptionPath)
+			signature := sign.Sign(encryptionPath)
+			hashPayload := base64.StdEncoding.EncodeToString([]byte(encryptionPath))
+			hashSignature := sign.Sign(hashPayload)
+			proxyURL += "?sign=" + signature + "&hashSign=" + hashSignature
 		}
 		remoteURL = proxyURL
 	}
