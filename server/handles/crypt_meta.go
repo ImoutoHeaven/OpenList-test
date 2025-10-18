@@ -96,23 +96,31 @@ func buildStorageChain(rawPath string) ([]storageChainNode, error) {
 	return nodes, nil
 }
 
-func pickNestedProxyURL(nodes []storageChainNode) string {
+type proxyCandidate struct {
+	url      string
+	signPath string
+}
+
+func pickNestedProxyURL(nodes []storageChainNode) (string, string) {
 	if len(nodes) == 0 {
-		return ""
+		return "", ""
 	}
-	candidates := make([]string, 0, len(nodes))
+	candidates := make([]proxyCandidate, 0, len(nodes))
 	for _, node := range nodes {
 		if url := common.GenerateDownProxyURL(node.storage.GetStorage(), node.rawPath); url != "" {
-			candidates = append(candidates, url)
+			candidates = append(candidates, proxyCandidate{
+				url:      url,
+				signPath: node.rawPath,
+			})
 		}
 	}
 	if len(candidates) >= 2 {
-		return candidates[1]
+		return candidates[1].url, candidates[1].signPath
 	}
 	if len(candidates) == 1 {
-		return candidates[0]
+		return candidates[0].url, candidates[0].signPath
 	}
-	return ""
+	return "", ""
 }
 
 func CryptMeta(c *gin.Context) {
@@ -238,13 +246,20 @@ func CryptMeta(c *gin.Context) {
 
 	useProxy := false
 	remoteURL := remoteLink.URL
-	selectedProxy := pickNestedProxyURL(storageChain)
+	selectedProxy, proxySignPath := pickNestedProxyURL(storageChain)
+	hashSignPath := ""
 	if selectedProxy != "" {
 		useProxy = true
 		remoteURL = selectedProxy
+		if strings.Contains(remoteURL, "?sign=") {
+			hashSignPath = proxySignPath
+		}
 	} else if proxyURL := common.GenerateDownProxyURL(remoteStorage.GetStorage(), encryptionPath); proxyURL != "" {
 		useProxy = true
 		remoteURL = proxyURL
+		if strings.Contains(remoteURL, "?sign=") {
+			hashSignPath = encryptionPath
+		}
 	} else if remoteStorage.Config().MustProxy() || remoteStorage.GetStorage().WebProxy {
 		useProxy = true
 		proxyURL := common.GetApiUrl(c) + "/p" + utils.EncodePath(encryptionPath, true)
@@ -255,6 +270,16 @@ func CryptMeta(c *gin.Context) {
 			proxyURL += "?sign=" + signature + "&hashSign=" + hashSignature
 		}
 		remoteURL = proxyURL
+	}
+
+	if hashSignPath != "" && !strings.Contains(remoteURL, "hashSign=") {
+		hashPayload := base64.StdEncoding.EncodeToString([]byte(hashSignPath))
+		hashSignature := sign.Sign(hashPayload)
+		separator := "?"
+		if strings.Contains(remoteURL, "?") {
+			separator = "&"
+		}
+		remoteURL += separator + "hashSign=" + hashSignature
 	}
 
 	var encryptedSize int64
