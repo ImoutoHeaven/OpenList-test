@@ -168,6 +168,22 @@ func CryptMeta(c *gin.Context) {
 		Header: c.Request.Header.Clone(),
 	}
 
+	ipWorker := strings.TrimSpace(c.Request.Header.Get("CF-Connecting-IP-WORKERS"))
+	ipSign := ""
+	if ipWorker != "" {
+		ipSign = sign.Sign(ipWorker)
+	}
+	appendIPSign := func(url string) string {
+		if url == "" || ipSign == "" || strings.Contains(url, "ipSign=") || !strings.Contains(url, "hashSign=") {
+			return url
+		}
+		separator := "?"
+		if strings.Contains(url, "?") {
+			separator = "&"
+		}
+		return url + separator + "ipSign=" + ipSign
+	}
+
 	mode := "plain"
 	var (
 		fileHeaderSize   int
@@ -281,6 +297,7 @@ func CryptMeta(c *gin.Context) {
 		}
 		remoteURL += separator + "hashSign=" + hashSignature
 	}
+	remoteURL = appendIPSign(remoteURL)
 
 	var encryptedSize int64
 	if remoteLink.ContentLength > 0 {
