@@ -36,7 +36,11 @@ type Crypt struct {
 const obfuscatedPrefix = "___Obfuscated___"
 
 func (d *Crypt) Config() driver.Config {
-	return config
+	cfg := config
+	if d.ExposeLink {
+		cfg.NoLinkURL = false
+	}
+	return cfg
 }
 
 func (d *Crypt) GetAddition() driver.Additional {
@@ -254,6 +258,10 @@ func (d *Crypt) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (
 	remoteLink, remoteFile, err := op.Link(ctx, d.remoteStorage, dstDirActualPath, args)
 	if err != nil {
 		return nil, err
+	}
+
+	if d.ExposeLink && remoteLink.URL != "" {
+		return remoteLink, nil
 	}
 
 	remoteSize := remoteLink.ContentLength
