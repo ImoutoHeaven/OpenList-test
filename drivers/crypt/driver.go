@@ -7,6 +7,7 @@ import (
 	"io"
 	stdpath "path"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
+	"github.com/maruel/natural"
 	rcCrypt "github.com/rclone/rclone/backend/crypt"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
@@ -185,6 +187,12 @@ func (d *Crypt) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([
 				result = append(result, &objWithThumb)
 			}
 		}
+	}
+
+	if len(result) > 1 {
+		sort.Slice(result, func(i, j int) bool {
+			return natural.Less(result[i].GetName(), result[j].GetName())
+		})
 	}
 
 	return result, nil
