@@ -19,7 +19,6 @@ import (
 	"github.com/avast/retry-go"
 	"github.com/go-resty/resty/v2"
 	jsoniter "github.com/json-iterator/go"
-	log "github.com/sirupsen/logrus"
 )
 
 var onedriveHostMap = map[string]Host{
@@ -63,7 +62,6 @@ func (d *Onedrive) GetMetaUrl(auth bool, path string) string {
 }
 
 func (d *Onedrive) refreshToken() error {
-	diagID := d.diagID()
 	d.tokenMu.Lock()
 	defer d.tokenMu.Unlock()
 	var err error
@@ -73,12 +71,7 @@ func (d *Onedrive) refreshToken() error {
 			break
 		}
 	}
-	if err != nil {
-		log.Warnf("%s token refresh failed for %s: %v", diagLogPrefix, diagID, err)
-		return err
-	}
-	log.Infof("%s token refresh succeeded for %s", diagLogPrefix, diagID)
-	return nil
+	return err
 }
 
 func (d *Onedrive) _refreshToken() error {
@@ -162,13 +155,10 @@ func (d *Onedrive) Request(url string, method string, callback base.ReqCallback,
 	}
 	if e.Error.Code != "" {
 		if e.Error.Code == "InvalidAuthenticationToken" {
-			log.Warnf("%s invalid authentication token detected for %s (%s), refreshing", diagLogPrefix, d.diagID(), url)
 			err = d.refreshToken()
 			if err != nil {
-				log.Errorf("%s token refresh failed after invalid token for %s: %v", diagLogPrefix, d.diagID(), err)
 				return nil, err
 			}
-			log.Infof("%s retrying request after token refresh for %s", diagLogPrefix, d.diagID())
 			return d.Request(url, method, callback, resp)
 		}
 		return nil, errors.New(e.Error.Message)

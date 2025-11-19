@@ -29,8 +29,6 @@ type Onedrive struct {
 	refreshOnce sync.Once
 }
 
-const diagLogPrefix = "[onedrive_diag]"
-
 func (d *Onedrive) Config() driver.Config {
 	return config
 }
@@ -137,7 +135,6 @@ func (d *Onedrive) Link(ctx context.Context, file model.Obj, args model.LinkArgs
 		_u.Host = d.CustomHost
 		u = _u.String()
 	}
-	log.Infof("%s graph link fetched id=%s path=%s url=%s", diagLogPrefix, d.diagID(), file.GetPath(), u)
 	return &model.Link{
 		URL: u,
 	}, nil
@@ -261,12 +258,12 @@ var _ driver.Driver = (*Onedrive)(nil)
 func (d *Onedrive) startTokenRefresher() {
 	ticker := time.NewTicker(30 * time.Minute)
 	defer ticker.Stop()
-	id := d.diagID()
 	for {
 		select {
 		case <-ticker.C:
 			if err := d.refreshToken(); err != nil {
-				log.Warnf("%s periodic token refresh failed for %s: %v", diagLogPrefix, id, err)
+				id := d.storageIdentifier()
+				log.Warnf("onedrive(%s): periodic token refresh failed: %v", id, err)
 			}
 		case <-d.stopCh:
 			return
@@ -274,7 +271,7 @@ func (d *Onedrive) startTokenRefresher() {
 	}
 }
 
-func (d *Onedrive) diagID() string {
+func (d *Onedrive) storageIdentifier() string {
 	id := d.GetStorage().MountPath
 	if id == "" {
 		id = "unknown"
