@@ -18,10 +18,11 @@ type ListArgs struct {
 }
 
 type LinkArgs struct {
-	IP       string
-	Header   http.Header
-	Type     string
-	Redirect bool
+	IP           string
+	Header       http.Header
+	Type         string
+	Redirect     bool
+	ForceRefresh bool
 }
 
 type Link struct {

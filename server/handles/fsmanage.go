@@ -21,7 +21,8 @@ import (
 )
 
 type MkdirOrLinkReq struct {
-	Path string `json:"path" form:"path"`
+	Path    string `json:"path" form:"path"`
+	Refresh bool   `json:"refresh" form:"refresh"`
 }
 
 func FsMkdir(c *gin.Context) {
@@ -395,7 +396,17 @@ func Link(c *gin.Context) {
 		})
 		return
 	}
-	link, _, err := fs.Link(c.Request.Context(), rawPath, model.LinkArgs{IP: c.ClientIP(), Header: c.Request.Header, Redirect: true})
+	refresh := req.Refresh
+	if q := c.Query("refresh"); q != "" {
+		refresh = strings.EqualFold(q, "true") || q == "1"
+	}
+	link, _, err := fs.Link(c.Request.Context(), rawPath, model.LinkArgs{
+		IP:           c.ClientIP(),
+		Header:       c.Request.Header,
+		Type:         c.Query("type"),
+		Redirect:     true,
+		ForceRefresh: refresh,
+	})
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return

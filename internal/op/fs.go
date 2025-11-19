@@ -294,11 +294,13 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 	}
 
 	key := stdpath.Join(Key(storage, path), args.Type)
-	if link, ok := linkCache.Get(key); ok {
-		if storage.Config().Name == "Onedrive" {
-			log.Infof("%s link cache hit for storage=%s path=%s type=%s", onedriveDiagPrefix, storage.GetStorage().MountPath, path, args.Type)
+	if !args.ForceRefresh {
+		if link, ok := linkCache.Get(key); ok {
+			if storage.Config().Name == "Onedrive" {
+				log.Infof("%s link cache hit for storage=%s path=%s type=%s", onedriveDiagPrefix, storage.GetStorage().MountPath, path, args.Type)
+			}
+			return link, file, nil
 		}
-		return link, file, nil
 	}
 
 	var forget any
@@ -312,19 +314,19 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 			linkM = link
 			return nil, errLinkMFileCache
 		}
-		if link.Expiration != nil {
+		if link.Expiration != nil && !args.ForceRefresh {
 			if storage.Config().Name == "Onedrive" {
 				log.Infof("%s caching link with expiration for storage=%s path=%s type=%s duration=%s", onedriveDiagPrefix, storage.GetStorage().MountPath, path, args.Type, link.Expiration.String())
 			}
 			linkCache.Set(key, link, cache.WithEx[*model.Link](*link.Expiration))
-		} else if storage.Config().Name == "Onedrive" {
+		} else if storage.Config().Name == "Onedrive" && !args.ForceRefresh {
 			log.Infof("%s no link cache entry created for storage=%s path=%s type=%s (no expiration)", onedriveDiagPrefix, storage.GetStorage().MountPath, path, args.Type)
 		}
 		link.AddIfCloser(forget)
 		return link, nil
 	}
 
-	if storage.Config().OnlyLinkMFile {
+	if storage.Config().OnlyLinkMFile || args.ForceRefresh {
 		link, err := fn()
 		if err != nil {
 			return nil, nil, err
