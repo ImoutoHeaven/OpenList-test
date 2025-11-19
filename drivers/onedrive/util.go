@@ -62,6 +62,8 @@ func (d *Onedrive) GetMetaUrl(auth bool, path string) string {
 }
 
 func (d *Onedrive) refreshToken() error {
+	d.tokenMu.Lock()
+	defer d.tokenMu.Unlock()
 	var err error
 	for i := 0; i < 3; i++ {
 		err = d._refreshToken()

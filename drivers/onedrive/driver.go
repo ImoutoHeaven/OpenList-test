@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"path"
 	"sync"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -14,6 +15,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 )
 
 type Onedrive struct {
@@ -22,6 +24,9 @@ type Onedrive struct {
 	AccessToken string
 	root        *Object
 	mutex       sync.Mutex
+	tokenMu     sync.Mutex
+	stopCh      chan struct{}
+	refreshOnce sync.Once
 }
 
 func (d *Onedrive) Config() driver.Config {
@@ -36,10 +41,34 @@ func (d *Onedrive) Init(ctx context.Context) error {
 	if d.ChunkSize < 1 {
 		d.ChunkSize = 5
 	}
-	return d.refreshToken()
+	// ensure stopCh/refreshOnce are reusable after Drop/disable->enable flows
+	if d.stopCh == nil {
+		d.stopCh = make(chan struct{})
+	} else {
+		select {
+		case <-d.stopCh:
+			d.stopCh = make(chan struct{})
+			d.refreshOnce = sync.Once{}
+		default:
+		}
+	}
+	if err := d.refreshToken(); err != nil {
+		return err
+	}
+	d.refreshOnce.Do(func() {
+		go d.startTokenRefresher()
+	})
+	return nil
 }
 
 func (d *Onedrive) Drop(ctx context.Context) error {
+	if d.stopCh != nil {
+		select {
+		case <-d.stopCh:
+		default:
+			close(d.stopCh)
+		}
+	}
 	return nil
 }
 
@@ -224,3 +253,23 @@ func (d *Onedrive) GetDetails(ctx context.Context) (*model.StorageDetails, error
 }
 
 var _ driver.Driver = (*Onedrive)(nil)
+
+// startTokenRefresher periodically refreshes token to avoid long-run expiry drift.
+func (d *Onedrive) startTokenRefresher() {
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+	id := d.GetStorage().MountPath
+	if d.IsSharepoint && d.SiteId != "" {
+		id = fmt.Sprintf("%s|site:%s", id, d.SiteId)
+	}
+	for {
+		select {
+		case <-ticker.C:
+			if err := d.refreshToken(); err != nil {
+				log.Warnf("onedrive(%s): periodic token refresh failed: %v", id, err)
+			}
+		case <-d.stopCh:
+			return
+		}
+	}
+}
