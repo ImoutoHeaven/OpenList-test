@@ -25,6 +25,8 @@ import (
 var listCache = cache.NewMemCache(cache.WithShards[[]model.Obj](64))
 var listG singleflight.Group[[]model.Obj]
 
+const onedriveDiagPrefix = "[onedrive_diag]"
+
 func updateCacheObj(storage driver.Driver, path string, oldObj model.Obj, newObj model.Obj) {
 	key := Key(storage, path)
 	objs, ok := listCache.Get(key)
@@ -293,6 +295,9 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 
 	key := stdpath.Join(Key(storage, path), args.Type)
 	if link, ok := linkCache.Get(key); ok {
+		if storage.Config().Name == "Onedrive" {
+			log.Infof("%s link cache hit for storage=%s path=%s type=%s", onedriveDiagPrefix, storage.GetStorage().MountPath, path, args.Type)
+		}
 		return link, file, nil
 	}
 
@@ -308,7 +313,12 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 			return nil, errLinkMFileCache
 		}
 		if link.Expiration != nil {
+			if storage.Config().Name == "Onedrive" {
+				log.Infof("%s caching link with expiration for storage=%s path=%s type=%s duration=%s", onedriveDiagPrefix, storage.GetStorage().MountPath, path, args.Type, link.Expiration.String())
+			}
 			linkCache.Set(key, link, cache.WithEx[*model.Link](*link.Expiration))
+		} else if storage.Config().Name == "Onedrive" {
+			log.Infof("%s no link cache entry created for storage=%s path=%s type=%s (no expiration)", onedriveDiagPrefix, storage.GetStorage().MountPath, path, args.Type)
 		}
 		link.AddIfCloser(forget)
 		return link, nil
