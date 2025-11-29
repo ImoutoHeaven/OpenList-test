@@ -394,18 +394,8 @@ func (d *BaiduNetdisk) quota(ctx context.Context) (model.DiskUsage, error) {
 	return driver.DiskUsageFromUsedAndTotal(resp.Used, resp.Total), nil
 }
 
-// getUploadUrl 从开放平台获取上传域名/地址，并发请求会被合并，结果会在 uploadid 生命周期内复用。
-// 如果获取失败，则返回 Upload API设置项。
 func (d *BaiduNetdisk) getUploadUrl(path, uploadId string) string {
-	if !d.UseDynamicUploadAPI || uploadId == "" {
-		return d.UploadAPI
-	}
-
-	uploadUrl, err := d.requestForUploadUrl(path, uploadId)
-	if err != nil {
-		return d.UploadAPI
-	}
-	return uploadUrl
+	return d.UploadAPI
 }
 
 // requestForUploadUrl 请求获取上传地址。

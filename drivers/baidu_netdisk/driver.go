@@ -50,8 +50,8 @@ func (d *BaiduNetdisk) Init(ctx context.Context) error {
 	d.uploadThread, _ = strconv.Atoi(d.UploadThread)
 	if d.uploadThread < 1 {
 		d.uploadThread, d.UploadThread = 1, "1"
-	} else if d.uploadThread > 32 {
-		d.uploadThread, d.UploadThread = 32, "32"
+	} else if d.uploadThread > 64 {
+		d.uploadThread, d.UploadThread = 64, "64"
 	}
 
 	if _, err := url.Parse(d.UploadAPI); d.UploadAPI == "" || err != nil {
