@@ -64,12 +64,16 @@ func FsListSplit(c *gin.Context) {
 		return
 	}
 	req.Validate()
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if req.Refresh && !user.IsAdmin() {
+		common.ErrorStrResp(c, "Refresh without permission", 403)
+		return
+	}
 	if strings.HasPrefix(req.Path, "/@s") {
 		req.Path = strings.TrimPrefix(req.Path, "/@s")
 		SharingList(c, &req)
 		return
 	}
-	user := c.Request.Context().Value(conf.UserKey).(*model.User)
 	if user.IsGuest() && user.Disabled {
 		common.ErrorStrResp(c, "Guest user is disabled, login please", 401)
 		return
