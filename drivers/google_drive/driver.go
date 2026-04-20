@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -20,6 +22,15 @@ type GoogleDrive struct {
 	AccessToken            string
 	ServiceAccountFile     int
 	ServiceAccountFileList []string
+	modeCfg                downloadModeConfig
+	accounts               []accountRuntime
+	accountPool            *accountPool
+	accountStore           accountStore
+	accountStateMu         sync.RWMutex
+	accountRefreshSlots    []*sync.Mutex
+	accountRefreshMu       sync.Mutex
+	accountRefreshWG       sync.WaitGroup
+	accountRefreshClosed   bool
 }
 
 func (d *GoogleDrive) Config() driver.Config {
@@ -34,11 +45,38 @@ func (d *GoogleDrive) Init(ctx context.Context) error {
 	if d.ChunkSize == 0 {
 		d.ChunkSize = 5
 	}
-	return d.refreshToken()
+
+	cfg, err := validateDownloadModeConfig(d.Addition)
+	if err != nil {
+		return err
+	}
+	d.modeCfg = cfg
+
+	if !cfg.Enabled {
+		if strings.TrimSpace(d.RefreshToken) == "" {
+			return fmt.Errorf("google_drive: refresh_token is required in single-account mode")
+		}
+		return d.refreshToken()
+	}
+
+	return d.initAccountsJSONMode(ctx)
 }
 
 func (d *GoogleDrive) Drop(ctx context.Context) error {
-	return nil
+	if !d.modeCfg.Enabled || d.accountStore == nil {
+		return nil
+	}
+	d.stopAccountRefreshes()
+	waitErr := d.waitForAccountRefreshes(ctx)
+	flushErr := d.accountStore.flush(ctx)
+	shutdownErr := d.accountStore.shutdown(ctx)
+	if waitErr != nil {
+		return waitErr
+	}
+	if flushErr != nil {
+		return flushErr
+	}
+	return shutdownErr
 }
 
 func (d *GoogleDrive) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
@@ -53,14 +91,24 @@ func (d *GoogleDrive) List(ctx context.Context, dir model.Obj, args model.ListAr
 
 func (d *GoogleDrive) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
 	url := fmt.Sprintf("https://www.googleapis.com/drive/v3/files/%s?includeItemsFromAllDrives=true&supportsAllDrives=true", file.GetID())
-	_, err := d.request(url, http.MethodGet, nil, nil)
-	if err != nil {
-		return nil, err
+	authorizationToken := d.currentAccessToken()
+	if d.modeCfg.Enabled {
+		winningToken, _, err := d.requestDownloadWithRotation(ctx, url, http.MethodGet, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		authorizationToken = winningToken
+	} else {
+		_, err := d.request(url, http.MethodGet, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		authorizationToken = d.currentAccessToken()
 	}
 	link := model.Link{
 		URL: url + "&alt=media&acknowledgeAbuse=true",
 		Header: http.Header{
-			"Authorization": []string{"Bearer " + d.AccessToken},
+			"Authorization": []string{"Bearer " + authorizationToken},
 		},
 	}
 	return &link, nil
@@ -120,6 +168,13 @@ func (d *GoogleDrive) Put(ctx context.Context, dstDir model.Obj, stream model.Fi
 		res  *resty.Response
 		err  error
 	)
+	accessToken := d.currentAccessToken()
+	if d.modeCfg.Enabled {
+		accessToken, err = d.primaryAccessToken()
+		if err != nil {
+			return err
+		}
+	}
 	if obj != nil {
 		url = fmt.Sprintf("https://www.googleapis.com/upload/drive/v3/files/%s?uploadType=resumable&supportsAllDrives=true", obj.GetID())
 		data = base.Json{}
@@ -132,7 +187,7 @@ func (d *GoogleDrive) Put(ctx context.Context, dstDir model.Obj, stream model.Fi
 	}
 	req := base.NoRedirectClient.R().
 		SetHeaders(map[string]string{
-			"Authorization":           "Bearer " + d.AccessToken,
+			"Authorization":           "Bearer " + accessToken,
 			"X-Upload-Content-Type":   stream.GetMimetype(),
 			"X-Upload-Content-Length": strconv.FormatInt(stream.GetSize(), 10),
 		}).
@@ -147,6 +202,13 @@ func (d *GoogleDrive) Put(ctx context.Context, dstDir model.Obj, stream model.Fi
 	}
 	if e.Error.Code != 0 {
 		if e.Error.Code == 401 {
+			if d.modeCfg.Enabled {
+				err = d.refreshPrimaryAccount(ctx)
+				if err != nil {
+					return err
+				}
+				return d.Put(ctx, dstDir, stream, up)
+			}
 			err = d.refreshToken()
 			if err != nil {
 				return err
@@ -157,10 +219,7 @@ func (d *GoogleDrive) Put(ctx context.Context, dstDir model.Obj, stream model.Fi
 	}
 	putUrl := res.Header().Get("location")
 	if stream.GetSize() < d.ChunkSize*1024*1024 {
-		_, err = d.request(putUrl, http.MethodPut, func(req *resty.Request) {
-			req.SetHeader("Content-Length", strconv.FormatInt(stream.GetSize(), 10)).
-				SetBody(driver.NewLimitedUploadStream(ctx, stream))
-		}, nil)
+		err = d.smallFileUpload(ctx, stream, putUrl)
 	} else {
 		err = d.chunkUpload(ctx, stream, putUrl, up)
 	}

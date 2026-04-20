@@ -19,6 +19,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/go-resty/resty/v2"
 	"github.com/golang-jwt/jwt/v4"
@@ -67,7 +68,7 @@ func (d *GoogleDrive) refreshToken() error {
 			}
 			return fmt.Errorf("empty token returned from official API, a wrong refresh token may have been used")
 		}
-		d.AccessToken = resp.AccessToken
+		d.setAccessToken(resp.AccessToken)
 		d.RefreshToken = resp.RefreshToken
 		op.MustSaveDriverStorage(d)
 		return nil
@@ -165,7 +166,7 @@ func (d *GoogleDrive) refreshToken() error {
 		if e.Error != "" {
 			return fmt.Errorf(e.Error)
 		}
-		d.AccessToken = resp.AccessToken
+		d.setAccessToken(resp.AccessToken)
 		return nil
 	} else if os.IsExist(gdsaFileErr) {
 		return gdsaFileErr
@@ -187,13 +188,47 @@ func (d *GoogleDrive) refreshToken() error {
 	if e.Error != "" {
 		return fmt.Errorf(e.Error)
 	}
-	d.AccessToken = resp.AccessToken
+	d.setAccessToken(resp.AccessToken)
 	return nil
 }
 
 func (d *GoogleDrive) request(url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	if d.modeCfg.Enabled {
+		if err := d.syncPrimaryAccessToken(); err != nil {
+			return nil, err
+		}
+		accessToken, err := d.primaryAccessToken()
+		if err != nil {
+			return nil, err
+		}
+		body, statusCode, err := executeRequestWithToken(context.Background(), accessToken, url, method, callback, resp)
+		if err != nil {
+			return nil, err
+		}
+		if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
+			return body, nil
+		}
+		if statusCode == http.StatusUnauthorized {
+			if err := d.refreshPrimaryAccount(context.Background()); err != nil {
+				return nil, err
+			}
+			accessToken, err = d.primaryAccessToken()
+			if err != nil {
+				return nil, err
+			}
+			body, statusCode, err = executeRequestWithToken(context.Background(), accessToken, url, method, callback, resp)
+			if err != nil {
+				return nil, err
+			}
+			if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
+				return body, nil
+			}
+		}
+		return nil, requestErrorFromBody(statusCode, body)
+	}
+
 	req := base.RestyClient.R()
-	req.SetHeader("Authorization", "Bearer "+d.AccessToken)
+	req.SetHeader("Authorization", "Bearer "+d.currentAccessToken())
 	req.SetQueryParam("includeItemsFromAllDrives", "true")
 	req.SetQueryParam("supportsAllDrives", "true")
 	if callback != nil {
@@ -254,7 +289,53 @@ func (d *GoogleDrive) getFiles(id string) ([]File, error) {
 	return res, nil
 }
 
+func (d *GoogleDrive) smallFileUpload(ctx context.Context, file model.FileStreamer, url string) error {
+	if !d.modeCfg.Enabled {
+		_, err := d.request(url, http.MethodPut, func(req *resty.Request) {
+			req.SetHeader("Content-Length", strconv.FormatInt(file.GetSize(), 10)).
+				SetBody(driver.NewLimitedUploadStream(ctx, file))
+		}, nil)
+		return err
+	}
+
+	for {
+		if utils.IsCanceled(ctx) {
+			return ctx.Err()
+		}
+		accessToken, err := d.primaryAccessToken()
+		if err != nil {
+			return err
+		}
+		reader, err := file.RangeRead(http_range.Range{Start: 0, Length: file.GetSize()})
+		if err != nil {
+			return err
+		}
+		body, statusCode, err := executeRequestWithToken(ctx, accessToken, url, http.MethodPut, func(req *resty.Request) {
+			req.SetHeader("Content-Length", strconv.FormatInt(file.GetSize(), 10)).
+				SetBody(driver.NewLimitedUploadStream(ctx, reader))
+		}, nil)
+		if err != nil {
+			return err
+		}
+		if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
+			return nil
+		}
+		if statusCode != http.StatusUnauthorized {
+			return requestErrorFromBody(statusCode, body)
+		}
+		if err := d.refreshPrimaryAccount(ctx); err != nil {
+			return err
+		}
+	}
+}
+
 func (d *GoogleDrive) chunkUpload(ctx context.Context, file model.FileStreamer, url string, up driver.UpdateProgress) error {
+	if d.modeCfg.Enabled {
+		if _, err := d.primaryAccessToken(); err != nil {
+			return err
+		}
+	}
+
 	defaultChunkSize := d.ChunkSize * 1024 * 1024
 	ss, err := stream.NewStreamSectionReader(file, int(defaultChunkSize), &up)
 	if err != nil {
@@ -274,13 +355,21 @@ func (d *GoogleDrive) chunkUpload(ctx context.Context, file model.FileStreamer, 
 		}
 		limitedReader := driver.NewLimitedUploadStream(ctx, reader)
 		err = retry.Do(func() error {
+			accessToken := d.currentAccessToken()
+			if d.modeCfg.Enabled {
+				var err error
+				accessToken, err = d.primaryAccessToken()
+				if err != nil {
+					return err
+				}
+			}
 			reader.Seek(0, io.SeekStart)
 			req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, limitedReader)
 			if err != nil {
 				return err
 			}
 			req.Header = map[string][]string{
-				"Authorization":  {"Bearer " + d.AccessToken},
+				"Authorization":  {"Bearer " + accessToken},
 				"Content-Length": {strconv.FormatInt(chunkSize, 10)},
 				"Content-Range":  {fmt.Sprintf("bytes %d-%d/%d", offset, offset+chunkSize-1, file.GetSize())},
 			}
@@ -294,10 +383,21 @@ func (d *GoogleDrive) chunkUpload(ctx context.Context, file model.FileStreamer, 
 			utils.Json.Unmarshal(bytes, &e)
 			if e.Error.Code != 0 {
 				if e.Error.Code == 401 {
+					if d.modeCfg.Enabled {
+						err = d.refreshPrimaryAccount(ctx)
+						if err != nil {
+							return err
+						}
+						if err := d.syncPrimaryAccessToken(); err != nil {
+							return err
+						}
+						return fmt.Errorf("google_drive: retry primary account chunk after refresh")
+					}
 					err = d.refreshToken()
 					if err != nil {
 						return err
 					}
+					return fmt.Errorf("google_drive: retry chunk after refresh")
 				}
 				return fmt.Errorf("%s: %v", e.Error.Message, e.Error.Errors)
 			}
