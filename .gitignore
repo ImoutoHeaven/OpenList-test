@@ -25,6 +25,7 @@ output/
 /build
 /data/
 /tmp/
+/\.worktrees/
 /log/
 /lang/
 /daemon/
