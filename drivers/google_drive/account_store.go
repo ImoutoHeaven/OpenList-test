@@ -44,6 +44,15 @@ type persistedAccountFileEntry struct {
 	Token        json.RawMessage `json:"token"`
 }
 
+type accountsJSONFormat int
+
+const (
+	accountsJSONFormatJSONArray accountsJSONFormat = iota
+	accountsJSONFormatJSONL
+)
+
+var persistedCredentialFields = []string{"token", "client_id", "client_secret"}
+
 func newAccountStore(initial []accountConfig, path string) (*fileAccountStore, error) {
 	return newAccountStoreWithHooks(initial, path, persistAccountsJSONFile, defaultAccountStoreBackoff)
 }
@@ -87,6 +96,16 @@ func persistAccountsJSONFile(path string, payload string) error {
 		return fmt.Errorf("google_drive: accounts_json must be an absolute path")
 	}
 
+	existingContent, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("google_drive: read accounts_json file: %w", err)
+	}
+
+	mergedPayload, err := mergePersistedAccountsJSON(existingContent, payload)
+	if err != nil {
+		return err
+	}
+
 	dir := filepath.Dir(path)
 	tmpFile, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -104,7 +123,7 @@ func persistAccountsJSONFile(path string, payload string) error {
 		_ = tmpFile.Close()
 		return fmt.Errorf("google_drive: chmod accounts_json temp file: %w", err)
 	}
-	if _, err := tmpFile.WriteString(payload); err != nil {
+	if _, err := tmpFile.WriteString(mergedPayload); err != nil {
 		_ = tmpFile.Close()
 		return fmt.Errorf("google_drive: write accounts_json temp file: %w", err)
 	}
@@ -120,6 +139,108 @@ func persistAccountsJSONFile(path string, payload string) error {
 	}
 	cleanup = false
 	return nil
+}
+
+func decodeAccountsJSONObjects(content []byte) ([]map[string]json.RawMessage, accountsJSONFormat, bool, error) {
+	raw := string(content)
+	hasTrailingNewline := strings.HasSuffix(raw, "\n")
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, accountsJSONFormatJSONArray, hasTrailingNewline, fmt.Errorf("google_drive: accounts_json must not be empty")
+	}
+
+	if strings.HasPrefix(trimmed, "[") {
+		var entries []map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(trimmed), &entries); err != nil {
+			return nil, accountsJSONFormatJSONArray, hasTrailingNewline, fmt.Errorf("google_drive: parse accounts_json: %w", err)
+		}
+		if len(entries) == 0 {
+			return nil, accountsJSONFormatJSONArray, hasTrailingNewline, fmt.Errorf("google_drive: accounts_json must not be empty")
+		}
+		return entries, accountsJSONFormatJSONArray, hasTrailingNewline, nil
+	}
+
+	lines := strings.Split(trimmed, "\n")
+	entries := make([]map[string]json.RawMessage, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var entry map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			return nil, accountsJSONFormatJSONL, hasTrailingNewline, fmt.Errorf("google_drive: parse accounts_json: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	if len(entries) == 0 {
+		return nil, accountsJSONFormatJSONL, hasTrailingNewline, fmt.Errorf("google_drive: accounts_json must not be empty")
+	}
+	return entries, accountsJSONFormatJSONL, hasTrailingNewline, nil
+}
+
+func encodeAccountsJSONObjects(entries []map[string]json.RawMessage, format accountsJSONFormat, hasTrailingNewline bool) (string, error) {
+	switch format {
+	case accountsJSONFormatJSONArray:
+		payload, err := json.Marshal(entries)
+		if err != nil {
+			return "", fmt.Errorf("google_drive: marshal accounts_json payload: %w", err)
+		}
+		return string(payload), nil
+	case accountsJSONFormatJSONL:
+		lines := make([]string, len(entries))
+		for i, entry := range entries {
+			payload, err := json.Marshal(entry)
+			if err != nil {
+				return "", fmt.Errorf("google_drive: marshal accounts_json payload: %w", err)
+			}
+			lines[i] = string(payload)
+		}
+		payload := strings.Join(lines, "\n")
+		if hasTrailingNewline {
+			payload += "\n"
+		}
+		return payload, nil
+	default:
+		return "", fmt.Errorf("google_drive: unknown accounts_json format %d", format)
+	}
+}
+
+func mergePersistedCredentialFields(existing, updated map[string]json.RawMessage) {
+	if existing == nil {
+		return
+	}
+	for _, field := range persistedCredentialFields {
+		value, ok := updated[field]
+		if !ok {
+			delete(existing, field)
+			continue
+		}
+		existing[field] = append(json.RawMessage(nil), value...)
+	}
+}
+
+func mergePersistedAccountsJSON(existingContent []byte, updatedPayload string) (string, error) {
+	existingEntries, format, hasTrailingNewline, err := decodeAccountsJSONObjects(existingContent)
+	if err != nil {
+		return "", err
+	}
+	updatedEntries, _, _, err := decodeAccountsJSONObjects([]byte(updatedPayload))
+	if err != nil {
+		return "", err
+	}
+	if len(existingEntries) != len(updatedEntries) {
+		return "", fmt.Errorf("google_drive: accounts_json entry count changed from %d to %d", len(existingEntries), len(updatedEntries))
+	}
+
+	for i := range existingEntries {
+		if existingEntries[i] == nil {
+			existingEntries[i] = make(map[string]json.RawMessage)
+		}
+		mergePersistedCredentialFields(existingEntries[i], updatedEntries[i])
+	}
+
+	return encodeAccountsJSONObjects(existingEntries, format, hasTrailingNewline)
 }
 
 func (s *fileAccountStore) setToken(index int, tokenJSON string) {

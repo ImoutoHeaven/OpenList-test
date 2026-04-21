@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -79,6 +80,66 @@ func TestAccountStore_PreservesExplicitAccountCredentials(t *testing.T) {
 	require.Len(t, entries, 1)
 	require.Equal(t, "entry-client-id", entries[0].ClientID)
 	require.Equal(t, "entry-client-secret", entries[0].ClientSecret)
+}
+
+func TestAccountStore_PreservesJSONLShapeAndUnknownFields(t *testing.T) {
+	path := writeTempAccountsFile(t, "{\"token\":{\"access_token\":\"seed\",\"refresh_token\":\"rseed\"},\"custom\":\"keep\"}\n{\"name\":\"named\",\"token\":{\"access_token\":\"seed-2\",\"refresh_token\":\"rseed-2\"},\"enabled\":true}\n")
+	accounts, err := parseAccountsJSON(path, Addition{})
+	require.NoError(t, err)
+	store, err := newAccountStore(accounts, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.shutdown(context.Background()) })
+
+	store.setToken(0, `{"access_token":"updated","refresh_token":"rupdated"}`)
+	require.NoError(t, store.flush(context.Background()))
+
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.True(t, strings.HasSuffix(string(raw), "\n"))
+	require.False(t, strings.HasPrefix(strings.TrimSpace(string(raw)), "["))
+
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	require.Len(t, lines, 2)
+
+	var first map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(lines[0]), &first))
+	require.JSONEq(t, `{"access_token":"updated","refresh_token":"rupdated"}`, string(first["token"]))
+	require.JSONEq(t, `"keep"`, string(first["custom"]))
+	_, hasGeneratedName := first["name"]
+	require.False(t, hasGeneratedName)
+
+	var second map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(lines[1]), &second))
+	require.JSONEq(t, `{"access_token":"seed-2","refresh_token":"rseed-2"}`, string(second["token"]))
+	require.JSONEq(t, `true`, string(second["enabled"]))
+	require.JSONEq(t, `"named"`, string(second["name"]))
+}
+
+func TestAccountStore_PreservesJSONArrayShapeAndUnknownFields(t *testing.T) {
+	path := writeTempAccountsFile(t, `[{"token":{"access_token":"seed","refresh_token":"rseed"},"custom":"keep"},{"name":"named","token":{"access_token":"seed-2","refresh_token":"rseed-2"},"enabled":true}]`)
+	accounts, err := parseAccountsJSON(path, Addition{})
+	require.NoError(t, err)
+	store, err := newAccountStore(accounts, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.shutdown(context.Background()) })
+
+	store.setToken(0, `{"access_token":"updated","refresh_token":"rupdated"}`)
+	require.NoError(t, store.flush(context.Background()))
+
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(strings.TrimSpace(string(raw)), "["))
+
+	var entries []map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &entries))
+	require.Len(t, entries, 2)
+	require.JSONEq(t, `{"access_token":"updated","refresh_token":"rupdated"}`, string(entries[0]["token"]))
+	require.JSONEq(t, `"keep"`, string(entries[0]["custom"]))
+	_, hasGeneratedName := entries[0]["name"]
+	require.False(t, hasGeneratedName)
+	require.JSONEq(t, `{"access_token":"seed-2","refresh_token":"rseed-2"}`, string(entries[1]["token"]))
+	require.JSONEq(t, `true`, string(entries[1]["enabled"]))
+	require.JSONEq(t, `"named"`, string(entries[1]["name"]))
 }
 
 func TestAccountStore_CoalescesRapidUpdatesAndRetriesTransientFailures(t *testing.T) {
