@@ -24,6 +24,7 @@ func ResetToken(c *gin.Context) {
 		return
 	}
 	sign.Instance()
+	op.RefreshLinkAPISigner()
 	common.SuccessResp(c, token)
 }
 

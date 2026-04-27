@@ -7,6 +7,7 @@ import (
 	stdpath "path"
 	"strings"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
@@ -50,6 +51,26 @@ func (d *Strm) getRootAndPath(path string) (string, string) {
 		return parts[0], ""
 	}
 	return parts[0], parts[1]
+}
+
+func (d *Strm) ResolveLinkAPIRawPath(ctx context.Context, rawPath string) (string, error) {
+	mountPath := utils.GetActualMountPath(d.GetStorage().MountPath)
+	strmPath := utils.FixAndCleanPath(strings.TrimPrefix(utils.FixAndCleanPath(rawPath), mountPath))
+	root, sub := d.getRootAndPath(strmPath)
+	dsts, ok := d.pathMap[root]
+	if !ok {
+		return "", errs.ObjectNotFound
+	}
+	for _, dst := range dsts {
+		nextRawPath := stdpath.Join(dst, sub)
+		if op.HasLinkAPIObject(ctx, nextRawPath) {
+			return nextRawPath, nil
+		}
+	}
+	if strings.HasSuffix(strmPath, ".strm") {
+		return "", errs.NewErr(errs.NotSupport, "strm virtual objects do not provide external downloadable links")
+	}
+	return "", errs.ObjectNotFound
 }
 
 func (d *Strm) list(ctx context.Context, dst, sub string, args *fs.ListArgs) ([]model.Obj, error) {

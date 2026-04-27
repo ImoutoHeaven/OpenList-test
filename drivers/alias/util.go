@@ -12,6 +12,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	log "github.com/sirupsen/logrus"
 )
@@ -85,6 +86,23 @@ func (d *Alias) getRootAndPath(path string) (string, string) {
 		return parts[0], ""
 	}
 	return parts[0], parts[1]
+}
+
+func (d *Alias) ResolveLinkAPIRawPath(ctx context.Context, rawPath string) (string, error) {
+	mountPath := utils.GetActualMountPath(d.GetStorage().MountPath)
+	aliasPath := utils.FixAndCleanPath(strings.TrimPrefix(utils.FixAndCleanPath(rawPath), mountPath))
+	root, sub := d.getRootAndPath(aliasPath)
+	dsts, ok := d.pathMap[root]
+	if !ok {
+		return "", errs.ObjectNotFound
+	}
+	for _, dst := range dsts {
+		nextRawPath := stdpath.Join(dst, sub)
+		if op.HasLinkAPIStorage(nextRawPath) {
+			return nextRawPath, nil
+		}
+	}
+	return "", errs.ObjectNotFound
 }
 
 func (d *Alias) link(ctx context.Context, reqPath string, args model.LinkArgs) (*model.Link, model.Obj, error) {

@@ -12,9 +12,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
-	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/pkg/generic"
-	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
@@ -382,29 +380,14 @@ func Link(c *gin.Context) {
 	//rawPath := stdpath.Join(user.BasePath, req.Path)
 	// why need not join base_path? because it's always the full path
 	rawPath := req.Path
-	storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
-	if err != nil {
-		common.ErrorResp(c, err, 500)
-		return
-	}
-	if storage.Config().NoLinkURL || storage.Config().OnlyLinkMFile {
-		common.SuccessResp(c, model.Link{
-			URL: fmt.Sprintf("%s/p%s?d&sign=%s",
-				common.GetApiUrl(c),
-				utils.EncodePath(rawPath, true),
-				sign.Sign(rawPath)),
-		})
-		return
-	}
 	refresh := req.Refresh
 	if q := c.Query("refresh"); q != "" {
 		refresh = strings.EqualFold(q, "true") || q == "1"
 	}
-	link, _, err := fs.Link(c.Request.Context(), rawPath, model.LinkArgs{
+	link, err := fs.ResolveActualLink(c.Request.Context(), rawPath, model.LinkArgs{
 		IP:           c.ClientIP(),
 		Header:       c.Request.Header,
 		Type:         c.Query("type"),
-		Redirect:     true,
 		ForceRefresh: refresh,
 	})
 	if err != nil {
