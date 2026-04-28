@@ -194,6 +194,9 @@ func (d *GoogleDrive) refreshToken() error {
 
 func (d *GoogleDrive) request(url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
 	if d.modeCfg.Enabled {
+		if method == http.MethodGet {
+			return d.requestReadWithRotation(context.Background(), url, method, callback, resp)
+		}
 		if err := d.syncPrimaryAccessToken(); err != nil {
 			return nil, err
 		}

@@ -170,6 +170,263 @@ func TestGoogleDrivePrimaryAccountRouting_ListRefreshesPrimaryAccountOn401(t *te
 	require.Equal(t, "refresh-0-next", d.accounts[0].Token.RefreshToken)
 }
 
+func TestGoogleDrivePrimaryAccountRouting_ListRotatesAfterSuccessful401RefreshStillFailsRetry(t *testing.T) {
+	initGoogleDriveTestEnv(t)
+
+	recorder := &authRecorder{}
+	refreshTokens := make([]string, 0, 1)
+	oldClient := base.RestyClient
+	base.RestyClient = newTestRestyClient().SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case isRefreshRequest(req):
+			refreshTokens = append(refreshTokens, req.URL.Query().Get("refresh_ui"))
+			require.Equal(t, "refresh-0", req.URL.Query().Get("refresh_ui"))
+			return newHTTPResponse(http.StatusOK, `{"refresh_token":"refresh-0-next","access_token":"refreshed-primary-token"}`, map[string]string{"Content-Type": "application/json"}), nil
+		default:
+			recorder.record(req.Header.Get("Authorization"))
+			switch req.Header.Get("Authorization") {
+			case "Bearer token-0":
+				return newHTTPResponse(http.StatusUnauthorized, `{"error":{"code":401,"message":"unauthorized"}}`, map[string]string{"Content-Type": "application/json"}), nil
+			case "Bearer refreshed-primary-token":
+				return newHTTPResponse(http.StatusTooManyRequests, `{"error":{"code":429}}`, map[string]string{"Content-Type": "application/json"}), nil
+			case "Bearer token-1":
+				return newHTTPResponse(http.StatusOK, `{"files":[],"nextPageToken":""}`, map[string]string{"Content-Type": "application/json"}), nil
+			default:
+				return nil, fmt.Errorf("unexpected authorization: %s", req.Header.Get("Authorization"))
+			}
+		}
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = oldClient
+	})
+
+	d := newAccountsJSONDriverWithTokens([]string{"token-0", "token-1", "token-2"})
+	d.UseOnlineAPI = true
+	d.APIAddress = "https://refresh.example"
+
+	_, err := d.getFiles("root")
+	require.NoError(t, err)
+	require.Equal(t, []string{"Bearer token-0", "Bearer refreshed-primary-token", "Bearer token-1"}, recorder.AllAuthorizations())
+	require.Equal(t, []string{"refresh-0"}, refreshTokens)
+	require.Equal(t, "refreshed-primary-token", d.AccessToken)
+	require.Equal(t, "refreshed-primary-token", d.accounts[0].Token.AccessToken)
+	require.Equal(t, "refresh-0-next", d.accounts[0].Token.RefreshToken)
+	require.Equal(t, "token-1", d.accounts[1].Token.AccessToken)
+	}
+
+func TestGoogleDrivePrimaryAccountRouting_ListContinuesRotationAfter401RefreshFailure(t *testing.T) {
+	initGoogleDriveTestEnv(t)
+
+	recorder := &authRecorder{}
+	refreshTokens := make([]string, 0, 1)
+	oldClient := base.RestyClient
+	base.RestyClient = newTestRestyClient().SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case isRefreshRequest(req):
+			refreshTokens = append(refreshTokens, req.URL.Query().Get("refresh_ui"))
+			return newHTTPResponse(http.StatusBadRequest, `{"text":"refresh failed"}`, map[string]string{"Content-Type": "application/json"}), nil
+		default:
+			recorder.record(req.Header.Get("Authorization"))
+			switch req.Header.Get("Authorization") {
+			case "Bearer token-0":
+				return newHTTPResponse(http.StatusUnauthorized, `{"error":{"code":401,"message":"unauthorized"}}`, map[string]string{"Content-Type": "application/json"}), nil
+			case "Bearer token-1":
+				return newHTTPResponse(http.StatusOK, `{"files":[],"nextPageToken":""}`, map[string]string{"Content-Type": "application/json"}), nil
+			default:
+				return nil, fmt.Errorf("unexpected authorization: %s", req.Header.Get("Authorization"))
+			}
+		}
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = oldClient
+	})
+
+	d := newAccountsJSONDriverWithTokens([]string{"token-0", "token-1", "token-2"})
+	d.UseOnlineAPI = true
+	d.APIAddress = "https://refresh.example"
+
+	_, err := d.getFiles("root")
+	require.NoError(t, err)
+	require.Equal(t, []string{"Bearer token-0", "Bearer token-1"}, recorder.AllAuthorizations())
+	require.Equal(t, []string{"refresh-0"}, refreshTokens)
+}
+
+func TestGoogleDrivePrimaryAccountRouting_ListRotationRespectsRetryBudget(t *testing.T) {
+	d, recorder := newAccountsJSONDriverForRestyTest(t,
+		[]string{"token-0", "token-1", "token-2"},
+		[]scriptedDriveResponse{
+			{Status: 503, Body: `{"error":{"code":503}}`},
+			{Status: 200, Body: `{"files":[],"nextPageToken":""}`},
+		},
+	)
+	d.modeCfg.DownloadRetryMax = 1
+
+	_, err := d.getFiles("root")
+	require.NoError(t, err)
+	require.Equal(t, []string{"Bearer token-0", "Bearer token-1"}, recorder.AllAuthorizations())
+}
+
+func TestGoogleDrivePrimaryAccountRouting_MakeDirStaysOnPrimaryAccountAfterRetryableFailure(t *testing.T) {
+	initGoogleDriveTestEnv(t)
+
+	recorder := &authRecorder{}
+	requestCount := 0
+	oldClient := base.RestyClient
+	base.RestyClient = newTestRestyClient().SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		recorder.record(req.Header.Get("Authorization"))
+		requestCount++
+		if requestCount == 1 {
+			return newHTTPResponse(http.StatusTooManyRequests, `{"error":{"code":429}}`, map[string]string{"Content-Type": "application/json"}), nil
+		}
+		return newHTTPResponse(http.StatusOK, `{}`, map[string]string{"Content-Type": "application/json"}), nil
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = oldClient
+	})
+
+	d := newAccountsJSONDriverWithTokens([]string{"token-0", "token-1", "token-2"})
+	err := d.MakeDir(context.Background(), &model.Object{ID: "root", IsFolder: true}, "child")
+	require.Error(t, err)
+	require.Equal(t, []string{"Bearer token-0"}, recorder.AllAuthorizations())
+}
+
+func TestGoogleDrivePrimaryAccountRouting_MakeDirRefreshesPrimaryAccountOn401WithoutRotation(t *testing.T) {
+	initGoogleDriveTestEnv(t)
+
+	recorder := &authRecorder{}
+	requestCount := 0
+	oldClient := base.RestyClient
+	base.RestyClient = newTestRestyClient().SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case isRefreshRequest(req):
+			require.Equal(t, "refresh-0", req.URL.Query().Get("refresh_ui"))
+			return newHTTPResponse(http.StatusOK, `{"refresh_token":"refresh-0-next","access_token":"refreshed-primary-token"}`, map[string]string{"Content-Type": "application/json"}), nil
+		default:
+			recorder.record(req.Header.Get("Authorization"))
+			requestCount++
+			if requestCount == 1 {
+				return newHTTPResponse(http.StatusUnauthorized, `{"error":{"code":401,"message":"unauthorized"}}`, map[string]string{"Content-Type": "application/json"}), nil
+			}
+			return newHTTPResponse(http.StatusOK, `{}`, map[string]string{"Content-Type": "application/json"}), nil
+		}
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = oldClient
+	})
+
+	d := newAccountsJSONDriverWithTokens([]string{"token-0", "token-1", "token-2"})
+	d.UseOnlineAPI = true
+	d.APIAddress = "https://refresh.example"
+
+	err := d.MakeDir(context.Background(), &model.Object{ID: "root", IsFolder: true}, "child")
+	require.NoError(t, err)
+	require.Equal(t, []string{"Bearer token-0", "Bearer refreshed-primary-token"}, recorder.AllAuthorizations())
+	require.Equal(t, "refreshed-primary-token", d.AccessToken)
+	require.Equal(t, "refreshed-primary-token", d.accounts[0].Token.AccessToken)
+	require.Equal(t, "token-1", d.accounts[1].Token.AccessToken)
+}
+
+func TestGoogleDrivePrimaryAccountRouting_ListReturnsRefreshFailureWhenAllRefreshesFail(t *testing.T) {
+	initGoogleDriveTestEnv(t)
+
+	recorder := &authRecorder{}
+	oldClient := base.RestyClient
+	base.RestyClient = newTestRestyClient().SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case isRefreshRequest(req):
+			return newHTTPResponse(http.StatusOK, `{"text":"refresh failed"}`, map[string]string{"Content-Type": "application/json"}), nil
+		default:
+			recorder.record(req.Header.Get("Authorization"))
+			return newHTTPResponse(http.StatusUnauthorized, `{"error":{"code":401,"message":"unauthorized"}}`, map[string]string{"Content-Type": "application/json"}), nil
+		}
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = oldClient
+	})
+
+	d := newAccountsJSONDriverWithTokens([]string{"token-0", "token-1"})
+	d.UseOnlineAPI = true
+	d.APIAddress = "https://refresh.example"
+
+	_, err := d.getFiles("root")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "refresh failed")
+	require.Equal(t, []string{"Bearer token-0", "Bearer token-1"}, recorder.AllAuthorizations())
+}
+
+func TestGoogleDrivePrimaryAccountRouting_ListReturnsLastRetryableRequestFailureAfterMixedExhaustion(t *testing.T) {
+	initGoogleDriveTestEnv(t)
+
+	recorder := &authRecorder{}
+	oldClient := base.RestyClient
+	base.RestyClient = newTestRestyClient().SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case isRefreshRequest(req):
+			return newHTTPResponse(http.StatusOK, `{"text":"refresh failed"}`, map[string]string{"Content-Type": "application/json"}), nil
+		default:
+			recorder.record(req.Header.Get("Authorization"))
+			switch req.Header.Get("Authorization") {
+			case "Bearer token-0":
+				return newHTTPResponse(http.StatusUnauthorized, `{"error":{"code":401,"message":"unauthorized"}}`, map[string]string{"Content-Type": "application/json"}), nil
+			case "Bearer token-1":
+				return newHTTPResponse(http.StatusTooManyRequests, `{"error":{"code":429,"message":"too many requests"}}`, map[string]string{"Content-Type": "application/json"}), nil
+			default:
+				return nil, fmt.Errorf("unexpected authorization: %s", req.Header.Get("Authorization"))
+			}
+		}
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = oldClient
+	})
+
+	d := newAccountsJSONDriverWithTokens([]string{"token-0", "token-1"})
+	d.UseOnlineAPI = true
+	d.APIAddress = "https://refresh.example"
+
+	_, err := d.getFiles("root")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "too many requests")
+	require.NotContains(t, err.Error(), "refresh failed")
+	require.Equal(t, []string{"Bearer token-0", "Bearer token-1"}, recorder.AllAuthorizations())
+}
+
+func TestGoogleDrivePrimaryAccountRouting_GetDetailsRotatesAfterPrimaryRefreshFailure(t *testing.T) {
+	initGoogleDriveTestEnv(t)
+
+	recorder := &authRecorder{}
+	oldClient := base.RestyClient
+	base.RestyClient = newTestRestyClient().SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case isRefreshRequest(req):
+			return newHTTPResponse(http.StatusOK, `{"text":"refresh failed"}`, map[string]string{"Content-Type": "application/json"}), nil
+		default:
+			recorder.record(req.Header.Get("Authorization"))
+			switch req.Header.Get("Authorization") {
+			case "Bearer token-0":
+				return newHTTPResponse(http.StatusUnauthorized, `{"error":{"code":401,"message":"unauthorized"}}`, map[string]string{"Content-Type": "application/json"}), nil
+			case "Bearer token-1":
+				return newHTTPResponse(http.StatusOK, `{"storageQuota":{"usage":"10","limit":"100"}}`, map[string]string{"Content-Type": "application/json"}), nil
+			default:
+				return nil, fmt.Errorf("unexpected authorization: %s", req.Header.Get("Authorization"))
+			}
+		}
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = oldClient
+	})
+
+	d := newAccountsJSONDriverWithTokens([]string{"token-0", "token-1", "token-2"})
+	d.UseOnlineAPI = true
+	d.APIAddress = "https://refresh.example"
+
+	details, err := d.GetDetails(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, details)
+	require.Equal(t, uint64(100), details.DiskUsage.TotalSpace)
+	require.Equal(t, uint64(90), details.DiskUsage.FreeSpace)
+	require.Equal(t, []string{"Bearer token-0", "Bearer token-1"}, recorder.AllAuthorizations())
+}
+
 func TestGoogleDrivePrimaryAccountRouting_PutUsesIndexZeroToken(t *testing.T) {
 	d, authRecorder := newAccountsJSONDriverForUploadTest(t, []string{"primary-token", "secondary-token"})
 

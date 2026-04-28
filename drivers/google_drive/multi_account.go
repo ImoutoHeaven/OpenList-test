@@ -553,6 +553,35 @@ func requestErrorFromBody(statusCode int, body []byte) error {
 	return fmt.Errorf("google_drive: request failed with status %d", statusCode)
 }
 
+func isRetryableReadStatus(statusCode int, body []byte) bool {
+	switch {
+	case statusCode == http.StatusUnauthorized:
+		return true
+	case statusCode == http.StatusTooManyRequests:
+		return true
+	case statusCode >= http.StatusInternalServerError && statusCode < 600:
+		return true
+	case statusCode != http.StatusForbidden:
+		return false
+	}
+
+	var driveErr Error
+	if err := json.Unmarshal(body, &driveErr); err != nil {
+		return false
+	}
+	retryableReasons := map[string]struct{}{
+		"userRateLimitExceeded": {},
+		"rateLimitExceeded":     {},
+		"quotaExceeded":         {},
+	}
+	for _, item := range driveErr.Error.Errors {
+		if _, ok := retryableReasons[item.Reason]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func isRetryableDownloadStatus(statusCode int, body []byte) bool {
 	switch {
 	case statusCode == http.StatusUnauthorized:
@@ -638,4 +667,83 @@ func (d *GoogleDrive) requestDownloadWithRotation(ctx context.Context, url strin
 	}
 
 	return "", nil, fmt.Errorf("google_drive: download rotation exhausted: %s", strings.Join(failures, "; "))
+}
+
+func (d *GoogleDrive) requestReadWithRotation(ctx context.Context, url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	d.accountStateMu.RLock()
+	accountCount := len(d.accounts)
+	d.accountStateMu.RUnlock()
+	if accountCount == 0 {
+		return nil, fmt.Errorf("google_drive: accounts_json must include at least one account")
+	}
+	attemptBudget := 1 + d.modeCfg.DownloadRetryMax
+	order := d.accountPool.nextAttemptOrder(accountCount)
+	if len(order) == 0 {
+		return nil, fmt.Errorf("google_drive: accounts_json must include at least one account")
+	}
+	if attemptBudget > len(order) {
+		attemptBudget = len(order)
+	}
+	primaryFirstOrder := make([]int, 0, len(order))
+	primaryFirstOrder = append(primaryFirstOrder, 0)
+	for _, index := range order {
+		if index == 0 {
+			continue
+		}
+		primaryFirstOrder = append(primaryFirstOrder, index)
+	}
+	order = primaryFirstOrder[:attemptBudget]
+
+	var lastStatusCode int
+	var lastBody []byte
+	var lastErr error
+	for _, index := range order {
+		account, err := d.accountSnapshot(index)
+		if err != nil {
+			return nil, err
+		}
+		body, statusCode, reqErr := executeRequestWithToken(ctx, account.Token.AccessToken, url, method, callback, resp)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		if statusCode == http.StatusUnauthorized {
+			if refreshErr := d.refreshAccount(ctx, index); refreshErr == nil {
+				account, err = d.accountSnapshot(index)
+				if err != nil {
+					return nil, err
+				}
+				body, statusCode, reqErr = executeRequestWithToken(ctx, account.Token.AccessToken, url, method, callback, resp)
+				if reqErr != nil {
+					return nil, reqErr
+				}
+			} else {
+				if ctx != nil && ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				lastErr = refreshErr
+				lastStatusCode = statusCode
+				lastBody = body
+				continue
+			}
+		}
+		if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
+			if index == 0 {
+				if err := d.syncPrimaryAccessToken(); err != nil {
+					return nil, err
+				}
+			}
+			return body, nil
+		}
+		if !isRetryableReadStatus(statusCode, body) {
+			return nil, requestErrorFromBody(statusCode, body)
+		}
+		lastErr = nil
+		lastStatusCode = statusCode
+		lastBody = body
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, requestErrorFromBody(lastStatusCode, lastBody)
 }
