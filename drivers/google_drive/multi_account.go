@@ -507,6 +507,9 @@ func (d *GoogleDrive) refreshAccount(ctx context.Context, index int) error {
 	if e.Error != "" {
 		return fmt.Errorf(e.Error)
 	}
+	if strings.TrimSpace(resp.AccessToken) == "" {
+		return fmt.Errorf("empty token returned from oauth API, a wrong refresh token may have been used")
+	}
 	account.Token.AccessToken = resp.AccessToken
 	if strings.TrimSpace(resp.RefreshToken) != "" {
 		account.Token.RefreshToken = resp.RefreshToken
@@ -556,6 +559,8 @@ func isRetryableDownloadStatus(statusCode int, body []byte) bool {
 		return true
 	case statusCode == http.StatusTooManyRequests:
 		return true
+	case statusCode == http.StatusForbidden:
+		return true
 	case statusCode >= http.StatusInternalServerError && statusCode < 600:
 		return true
 	case statusCode != http.StatusForbidden:
@@ -602,6 +607,24 @@ func (d *GoogleDrive) requestDownloadWithRotation(ctx context.Context, url strin
 		body, statusCode, reqErr := executeRequestWithToken(ctx, account.Token.AccessToken, url, method, callback, resp)
 		if reqErr != nil {
 			return "", nil, reqErr
+		}
+		if statusCode == http.StatusUnauthorized {
+			if refreshErr := d.refreshAccount(ctx, index); refreshErr == nil {
+				account, err = d.accountSnapshot(index)
+				if err != nil {
+					return "", nil, err
+				}
+				body, statusCode, reqErr = executeRequestWithToken(ctx, account.Token.AccessToken, url, method, callback, resp)
+				if reqErr != nil {
+					return "", nil, reqErr
+				}
+			} else {
+				if ctx != nil && ctx.Err() != nil {
+					return "", nil, ctx.Err()
+				}
+				failures = append(failures, fmt.Sprintf("%s status %d refresh failed: %v", account.Name, statusCode, refreshErr))
+				continue
+			}
 		}
 		if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
 			return account.Token.AccessToken, body, nil
