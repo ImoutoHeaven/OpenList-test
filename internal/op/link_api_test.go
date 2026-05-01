@@ -711,7 +711,7 @@ func TestResolveActualLink_StrmKeepsProbeAndResolutionOnSameChosenBalanceMemberP
 	}
 }
 
-func TestResolveActualLink_StrmProbePinningDoesNotPerturbGlobalBalanceSelection(t *testing.T) {
+func TestResolveActualLink_StrmProbePinningAdvancesGlobalBalanceSelectionExactlyOnce(t *testing.T) {
 	probeMount := uniqueMountPath(t, "probe-balance")
 	mustCreateStubStorage(t, probeMount, stubBehavior{
 		files: []string{"/movie.mkv"},
@@ -771,8 +771,11 @@ func TestResolveActualLink_StrmProbePinningDoesNotPerturbGlobalBalanceSelection(
 	if probeAfter == nil || controlAfter == nil {
 		t.Fatal("expected fresh global balance selections to stay available after Link API probe pinning")
 	}
-	if got, want := strings.HasSuffix(probeAfter.GetStorage().MountPath, ".balance"), strings.HasSuffix(controlAfter.GetStorage().MountPath, ".balance"); got != want {
-		t.Fatalf("expected Link API probe pinning not to perturb global balance selection, want balance=%t got balance=%t", want, got)
+	if got, want := strings.HasSuffix(controlAfter.GetStorage().MountPath, ".balance"), false; got != want {
+		t.Fatalf("expected control group to advance to the non-balance sibling after one direct authoritative step, want balance=%t got balance=%t", want, got)
+	}
+	if got, want := strings.HasSuffix(probeAfter.GetStorage().MountPath, ".balance"), true; got != want {
+		t.Fatalf("expected wrapped Link API request to consume exactly one authoritative advance overall, want balance=%t got balance=%t", want, got)
 	}
 }
 
@@ -928,6 +931,180 @@ func TestResolveActualLink_BalanceAdvancesAuthoritativeProgressionWithoutRequest
 		if got := link.URL; got != want {
 			t.Fatalf("request %d: expected authoritative balance progression URL %q, got %q", i+1, want, got)
 		}
+	}
+}
+
+func TestResolveActualLink_NestedAliasBalanceAdvancesAcrossRequestsAfterProbeFallback(t *testing.T) {
+	baseMount := uniqueMountPath(t, "balance")
+	mustCreateStubStorage(t, baseMount, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/member-one.bin"}, nil
+		},
+	})
+	mustCreateStubStorage(t, baseMount+".balance", stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/member-two.bin"}, nil
+		},
+	})
+
+	wrapperMount := uniqueMountPath(t, "alias")
+	mustCreateStorage(t, model.Storage{
+		MountPath: wrapperMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           baseMount,
+			ProtectSameName: true,
+		}),
+	})
+
+	for i, want := range []string{
+		"https://download.example.com/member-two.bin",
+		"https://download.example.com/member-one.bin",
+		"https://download.example.com/member-two.bin",
+	} {
+		link, err := op.ResolveActualLink(context.Background(), wrapperMount+"/file.bin", model.LinkArgs{})
+		if err != nil {
+			t.Fatalf("request %d: expected success, got error: %v", i+1, err)
+		}
+		if got := link.URL; got != want {
+			t.Fatalf("request %d: expected nested wrapper balance progression URL %q, got %q", i+1, want, got)
+		}
+	}
+}
+
+func TestResolveActualLink_ReusesPinnedBalanceAcrossFailedNestedBranchesInSingleRequest(t *testing.T) {
+	baseMount := uniqueMountPath(t, "balance")
+	memberOne := mustCreateStubStorage(t, baseMount, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/member-one.bin"}, nil
+		},
+	})
+	memberTwoMissing := mustCreateStubStorage(t, baseMount+".balance", stubBehavior{})
+
+	branchOneMount := uniqueMountPath(t, "branch-one")
+	mustCreateStorage(t, model.Storage{
+		MountPath: branchOneMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           baseMount,
+			ProtectSameName: true,
+		}),
+	})
+	branchTwoMount := uniqueMountPath(t, "branch-two")
+	mustCreateStorage(t, model.Storage{
+		MountPath: branchTwoMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           baseMount,
+			ProtectSameName: true,
+		}),
+	})
+
+	topMount := uniqueMountPath(t, "top")
+	mustCreateStorage(t, model.Storage{
+		MountPath: topMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           "docs:" + branchOneMount + "\ndocs:" + branchTwoMount,
+			ProtectSameName: true,
+		}),
+	})
+
+	_, err := op.ResolveActualLink(context.Background(), topMount+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected request to keep the first chosen missing balance member across duplicate nested branches")
+	}
+	if got := memberOne.linkCalls; got != 0 {
+		t.Fatalf("expected duplicate nested branches not to retry the alternate balance sibling in the same request, got %d link calls", got)
+	}
+	if got := memberTwoMissing.linkCalls; got != 0 {
+		t.Fatalf("expected missing chosen balance sibling to never reach link resolution, got %d link calls", got)
+	}
+
+	link, err := op.ResolveActualLink(context.Background(), topMount+"/file.bin", model.LinkArgs{})
+	if err != nil {
+		t.Fatalf("expected next request to advance to the other balance sibling, got error: %v", err)
+	}
+	if got, want := link.URL, "https://download.example.com/member-one.bin"; got != want {
+		t.Fatalf("expected next request to resolve through %q, got %q", want, got)
+	}
+}
+
+func TestResolveActualLink_ProbePinnedBalanceRequestsDoNotCollapseSameMemberAcrossOverlap(t *testing.T) {
+	baseMount := uniqueMountPath(t, "balance")
+	mustCreateStubStorage(t, baseMount, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/member-one.bin"}, nil
+		},
+	})
+	mustCreateStubStorage(t, baseMount+".balance", stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/member-two.bin"}, nil
+		},
+	})
+
+	wrapperMount := uniqueMountPath(t, "alias")
+	mustCreateStorage(t, model.Storage{
+		MountPath: wrapperMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           baseMount,
+			ProtectSameName: true,
+		}),
+	})
+
+	start := make(chan struct{})
+	type result struct {
+		url string
+		err error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			link, err := op.ResolveActualLink(context.Background(), wrapperMount+"/file.bin", model.LinkArgs{})
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			results <- result{url: link.URL}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	seen := map[string]int{}
+	for res := range results {
+		if res.err != nil {
+			t.Fatalf("expected overlapped request to resolve successfully, got error: %v", res.err)
+		}
+		seen[res.url]++
+	}
+	if got, want := len(seen), 2; got != want {
+		t.Fatalf("expected overlapped requests to split across both balance members, got %v", seen)
+	}
+	if got, want := seen["https://download.example.com/member-one.bin"], 1; got != want {
+		t.Fatalf("expected exactly one overlapped request to use member one, got counts %v", seen)
+	}
+	if got, want := seen["https://download.example.com/member-two.bin"], 1; got != want {
+		t.Fatalf("expected exactly one overlapped request to use member two, got counts %v", seen)
+	}
+
+	next, err := op.ResolveActualLink(context.Background(), wrapperMount+"/file.bin", model.LinkArgs{})
+	if err != nil {
+		t.Fatalf("expected follow-up request to resolve successfully, got error: %v", err)
+	}
+	if got, want := next.URL, "https://download.example.com/member-two.bin"; got != want {
+		t.Fatalf("expected follow-up request to continue global progression at %q, got %q", want, got)
 	}
 }
 

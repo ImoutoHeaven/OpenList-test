@@ -419,6 +419,7 @@ func getStorageVirtualFilesByPath(prefix string, rootCallback func(driver.Driver
 }
 
 var balanceMap generic_sync.MapOf[string, int]
+var balanceMu sync.Mutex
 
 // GetBalancedStorage get storage by path
 func GetBalancedStorage(path string) driver.Driver {
@@ -432,6 +433,8 @@ func GetBalancedStorage(path string) driver.Driver {
 		return storages[0]
 	default:
 		virtualPath := utils.GetActualMountPath(storages[0].GetStorage().MountPath)
+		balanceMu.Lock()
+		defer balanceMu.Unlock()
 		i, _ := balanceMap.LoadOrStore(virtualPath, 0)
 		i = (i + 1) % storageNum
 		balanceMap.Store(virtualPath, i)

@@ -22,7 +22,8 @@ type linkAPIRawPathResolver interface {
 }
 
 type linkAPIBalanceState struct {
-	pinnedMountPath map[string]string
+	pinnedMountPath       map[string]string
+	reserveBalanceOnProbe bool
 }
 
 type linkAPIBalanceStateKey struct{}
@@ -38,22 +39,20 @@ func HasLinkAPIStorage(rawPath string) bool {
 }
 
 func HasLinkAPIObject(ctx context.Context, rawPath string) bool {
-	ctx = ensureLinkAPIBalanceState(ctx)
+	ctx = ensureLinkAPIBalanceState(ctx, false)
 	ctx, seen := ensureLinkAPIProbeSeen(ctx)
 	seen = cloneLinkAPIProbeSeen(seen)
 	ctx = context.WithValue(ctx, linkAPIProbeSeenKey{}, seen)
 	state := getLinkAPIBalanceState(ctx)
 	probeState := cloneLinkAPIBalanceState(state)
 	probeCtx := context.WithValue(ctx, linkAPIBalanceStateKey{}, probeState)
-	if !hasLinkAPIObject(probeCtx, utils.FixAndCleanPath(rawPath), seen) {
-		return false
-	}
+	ok := hasLinkAPIObject(probeCtx, utils.FixAndCleanPath(rawPath), seen)
 	commitLinkAPIBalanceState(state, probeState)
-	return true
+	return ok
 }
 
 func HasLinkAPIObjectWithSeen(ctx context.Context, rawPath string, seen map[string]struct{}) bool {
-	ctx = ensureLinkAPIBalanceState(ctx)
+	ctx = ensureLinkAPIBalanceState(ctx, false)
 	seen = cloneLinkAPIProbeSeen(seen)
 	ctx = context.WithValue(ctx, linkAPIProbeSeenKey{}, seen)
 	return hasLinkAPIObject(ctx, rawPath, seen)
@@ -86,11 +85,17 @@ func hasLinkAPIObject(ctx context.Context, rawPath string, seen map[string]struc
 	return err == nil && obj != nil
 }
 
-func ensureLinkAPIBalanceState(ctx context.Context) context.Context {
-	if getLinkAPIBalanceState(ctx) != nil {
+func ensureLinkAPIBalanceState(ctx context.Context, reserveBalanceOnProbe bool) context.Context {
+	if state := getLinkAPIBalanceState(ctx); state != nil {
+		if reserveBalanceOnProbe {
+			state.reserveBalanceOnProbe = true
+		}
 		return ctx
 	}
-	return context.WithValue(ctx, linkAPIBalanceStateKey{}, &linkAPIBalanceState{pinnedMountPath: map[string]string{}})
+	return context.WithValue(ctx, linkAPIBalanceStateKey{}, &linkAPIBalanceState{
+		pinnedMountPath:       map[string]string{},
+		reserveBalanceOnProbe: reserveBalanceOnProbe,
+	})
 }
 
 func getLinkAPIBalanceState(ctx context.Context) *linkAPIBalanceState {
@@ -120,7 +125,10 @@ func cloneLinkAPIProbeSeen(seen map[string]struct{}) map[string]struct{} {
 }
 
 func cloneLinkAPIBalanceState(state *linkAPIBalanceState) *linkAPIBalanceState {
-	cloned := &linkAPIBalanceState{pinnedMountPath: map[string]string{}}
+	cloned := &linkAPIBalanceState{
+		pinnedMountPath:       map[string]string{},
+		reserveBalanceOnProbe: state != nil && state.reserveBalanceOnProbe,
+	}
 	if state == nil {
 		return cloned
 	}
@@ -140,6 +148,7 @@ func commitLinkAPIBalanceState(dst, src *linkAPIBalanceState) {
 		}
 		dst.pinnedMountPath[virtualPath] = mountPath
 	}
+	dst.reserveBalanceOnProbe = dst.reserveBalanceOnProbe || src.reserveBalanceOnProbe
 }
 
 func getLinkAPIStorageAndActualPath(ctx context.Context, rawPath string, advanceBalance bool) (driver.Driver, string, error) {
@@ -184,6 +193,13 @@ func getLinkAPIStorage(ctx context.Context, path string, advanceBalance bool) dr
 			}
 			return chosen
 		}
+		if state != nil && state.reserveBalanceOnProbe {
+			chosen := GetBalancedStorage(path)
+			if chosen != nil {
+				state.pinnedMountPath[virtualPath] = chosen.GetStorage().MountPath
+			}
+			return chosen
+		}
 		i, ok := balanceMap.Load(virtualPath)
 		if !ok {
 			i = 0
@@ -198,7 +214,7 @@ func getLinkAPIStorage(ctx context.Context, path string, advanceBalance bool) dr
 }
 
 func ResolveActualStoragePath(ctx context.Context, rawPath string) (driver.Driver, string, string, error) {
-	ctx = ensureLinkAPIBalanceState(ctx)
+	ctx = ensureLinkAPIBalanceState(ctx, true)
 	return resolveActualStoragePath(ctx, utils.FixAndCleanPath(rawPath), map[string]struct{}{})
 }
 
