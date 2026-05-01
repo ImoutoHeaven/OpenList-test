@@ -317,6 +317,124 @@ func TestResolveActualLink_AliasStopsAtFirstResolvableTargetPath(t *testing.T) {
 	}
 }
 
+func TestResolveActualLink_AliasContinuesPastMountedButMissingTargetUntilObjectExists(t *testing.T) {
+	firstMount := uniqueMountPath(t, "leaf-one")
+	firstLeaf := mustCreateStubStorage(t, firstMount, stubBehavior{})
+	secondMount := uniqueMountPath(t, "leaf-two")
+	secondLeaf := mustCreateStubStorage(t, secondMount, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/file.bin"}, nil
+		},
+	})
+
+	aliasMount := uniqueMountPath(t, "alias")
+	mustCreateStorage(t, model.Storage{
+		MountPath: aliasMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           "docs:" + firstMount + "\ndocs:" + secondMount,
+			ProtectSameName: true,
+		}),
+	})
+
+	link, err := op.ResolveActualLink(context.Background(), aliasMount+"/file.bin", model.LinkArgs{})
+	if err != nil {
+		t.Fatalf("expected alias to keep probing until a real downstream object exists, got error: %v", err)
+	}
+	if got, want := link.URL, "https://download.example.com/file.bin"; got != want {
+		t.Fatalf("expected downstream direct URL %q, got %q", want, got)
+	}
+	if got := firstLeaf.linkCalls; got != 0 {
+		t.Fatalf("expected missing first alias target to never reach link resolution, got %d link calls", got)
+	}
+	if got := secondLeaf.linkCalls; got != 1 {
+		t.Fatalf("expected second alias target to resolve exactly once, got %d link calls", got)
+	}
+}
+
+func TestResolveActualLink_NestedAliasBalanceContinuesPastMissingAliasTarget(t *testing.T) {
+	missingOriginMount := uniqueMountPath(t, "origin-missing")
+	missingOrigin := mustCreateStubStorage(t, missingOriginMount, stubBehavior{})
+	existingOriginMount := uniqueMountPath(t, "origin-existing")
+	existingOrigin := mustCreateStubStorage(t, existingOriginMount, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/file.bin"}, nil
+		},
+	})
+	unusedOriginMount := uniqueMountPath(t, "origin-unused")
+	unusedOrigin := mustCreateStubStorage(t, unusedOriginMount, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/unused.bin"}, nil
+		},
+	})
+
+	backendMount := uniqueMountPath(t, "backend")
+	mustCreateStorage(t, model.Storage{
+		MountPath: backendMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           unusedOriginMount,
+			ProtectSameName: true,
+		}),
+	})
+	mustCreateStorage(t, model.Storage{
+		MountPath: backendMount + ".balance",
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           "origin:" + missingOriginMount + "\norigin:" + existingOriginMount,
+			ProtectSameName: true,
+		}),
+	})
+
+	workerMount := uniqueMountPath(t, "worker")
+	mustCreateStorage(t, model.Storage{
+		MountPath: workerMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           unusedOriginMount,
+			ProtectSameName: true,
+		}),
+	})
+	mustCreateStorage(t, model.Storage{
+		MountPath: workerMount + ".balance",
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           backendMount,
+			ProtectSameName: true,
+		}),
+	})
+
+	guestMount := uniqueMountPath(t, "guest")
+	mustCreateStorage(t, model.Storage{
+		MountPath: guestMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           workerMount,
+			ProtectSameName: true,
+		}),
+	})
+
+	link, err := op.ResolveActualLink(context.Background(), guestMount+"/file.bin", model.LinkArgs{})
+	if err != nil {
+		t.Fatalf("expected nested alias balance path to resolve through the existing origin target, got error: %v", err)
+	}
+	if got, want := link.URL, "https://download.example.com/file.bin"; got != want {
+		t.Fatalf("expected downstream direct URL %q, got %q", want, got)
+	}
+	if got := missingOrigin.linkCalls; got != 0 {
+		t.Fatalf("expected missing origin target to never reach link resolution, got %d link calls", got)
+	}
+	if got := existingOrigin.linkCalls; got != 1 {
+		t.Fatalf("expected existing origin target to resolve exactly once, got %d link calls", got)
+	}
+	if got := unusedOrigin.linkCalls; got != 0 {
+		t.Fatalf("expected alternate balance siblings to be skipped, got %d link calls", got)
+	}
+}
+
 func TestResolveActualLink_AliasBalanceUsesChosenMemberOnly(t *testing.T) {
 	baseMount := uniqueMountPath(t, "balance")
 	successful := mustCreateStubStorage(t, baseMount, stubBehavior{

@@ -98,7 +98,7 @@ func (d *Alias) ResolveLinkAPIRawPath(ctx context.Context, rawPath string) (stri
 	}
 	for _, dst := range dsts {
 		nextRawPath := stdpath.Join(dst, sub)
-		if op.HasLinkAPIStorage(nextRawPath) {
+		if op.HasLinkAPIObject(ctx, nextRawPath) {
 			return nextRawPath, nil
 		}
 	}
