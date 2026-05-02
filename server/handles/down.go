@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -118,6 +119,13 @@ func Proxy(c *gin.Context) {
 		common.ErrorPage(c, err, 500)
 		return
 	}
+	if webDownloadLeafPointsToOpenListLocalRouting(common.GetApiUrl(c.Request.Context()), link) {
+		if link != nil {
+			_ = link.Close()
+		}
+		common.ErrorPage(c, fmt.Errorf("proxy leaf for %s points back to OpenList-local routing", route.RequestRawPath), 500)
+		return
+	}
 	proxy(c, link, file, webDownloadProxyRange(route))
 }
 
@@ -152,16 +160,10 @@ func redirect(c *gin.Context, link *model.Link) {
 	var err error
 	c.Header("Referrer-Policy", "no-referrer")
 	c.Header("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate")
-	if setting.GetBool(conf.ForwardDirectLinkParams) {
-		query := c.Request.URL.Query()
-		for _, v := range conf.SlicesMap[conf.IgnoreDirectLinkParams] {
-			query.Del(v)
-		}
-		link.URL, err = utils.InjectQuery(link.URL, query)
-		if err != nil {
-			common.ErrorPage(c, err, 500)
-			return
-		}
+	link.URL, err = webDownloadBrowserVisibleURL(link.URL, c.Request.URL.Query())
+	if err != nil {
+		common.ErrorPage(c, err, 500)
+		return
 	}
 	c.Redirect(302, link.URL)
 }
@@ -169,16 +171,10 @@ func redirect(c *gin.Context, link *model.Link) {
 func proxy(c *gin.Context, link *model.Link, file model.Obj, proxyRange bool) {
 	defer link.Close()
 	var err error
-	if link.URL != "" && setting.GetBool(conf.ForwardDirectLinkParams) {
-		query := c.Request.URL.Query()
-		for _, v := range conf.SlicesMap[conf.IgnoreDirectLinkParams] {
-			query.Del(v)
-		}
-		link.URL, err = utils.InjectQuery(link.URL, query)
-		if err != nil {
-			common.ErrorPage(c, err, 500)
-			return
-		}
+	link.URL, err = webDownloadBrowserVisibleURL(link.URL, c.Request.URL.Query())
+	if err != nil {
+		common.ErrorPage(c, err, 500)
+		return
 	}
 	if proxyRange {
 		link = common.ProxyRange(c, link, file.GetSize())
@@ -223,6 +219,55 @@ func proxy(c *gin.Context, link *model.Link, file model.Obj, proxyRange bool) {
 			common.ErrorPage(c, err, 500, true)
 		}
 	}
+}
+
+func webDownloadBrowserVisibleURL(rawURL string, query url.Values) (string, error) {
+	if rawURL == "" || !setting.GetBool(conf.ForwardDirectLinkParams) {
+		return rawURL, nil
+	}
+	for _, v := range conf.SlicesMap[conf.IgnoreDirectLinkParams] {
+		query.Del(v)
+	}
+	return utils.InjectQuery(rawURL, query)
+}
+
+func fsGetDirectLinkQuery(query url.Values) url.Values {
+	query.Del("path")
+	query.Del("password")
+	return query
+}
+
+func webDownloadLeafPointsToOpenListLocalRouting(apiURL string, link *model.Link) bool {
+	if link == nil || link.URL == "" {
+		return false
+	}
+	parsedURL, err := url.Parse(link.URL)
+	if err != nil {
+		return false
+	}
+	if parsedURL.IsAbs() {
+		parsedAPIURL, err := url.Parse(strings.TrimSuffix(apiURL, "/"))
+		if err != nil || !parsedAPIURL.IsAbs() || parsedAPIURL.Host == "" {
+			return false
+		}
+		if !strings.EqualFold(parsedAPIURL.Scheme, parsedURL.Scheme) || !strings.EqualFold(parsedAPIURL.Host, parsedURL.Host) {
+			return false
+		}
+	}
+	return webDownloadPathPointsToOpenListLocalRouting(apiURL, parsedURL.Path)
+}
+
+func webDownloadPathPointsToOpenListLocalRouting(apiURL, rawPath string) bool {
+	localPath := utils.FixAndCleanPath(rawPath)
+	if utils.IsSubPath("/p", localPath) || utils.IsSubPath("/d", localPath) {
+		return true
+	}
+	parsedAPIURL, err := url.Parse(strings.TrimSuffix(apiURL, "/"))
+	if err != nil {
+		return false
+	}
+	apiBasePath := utils.FixAndCleanPath(parsedAPIURL.Path)
+	return utils.IsSubPath(apiBasePath, localPath)
 }
 
 // TODO need optimize

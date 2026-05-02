@@ -371,7 +371,11 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 				return
 			}
 			defer link.Close()
-			rawURL = link.URL
+			rawURL, err = webDownloadBrowserVisibleURL(link.URL, fsGetDirectLinkQuery(c.Request.URL.Query()))
+			if err != nil {
+				common.ErrorResp(c, err, 500)
+				return
+			}
 		default:
 			common.ErrorResp(c, fmt.Errorf("unsupported web download policy %q", route.EffectivePolicy), 500)
 			return

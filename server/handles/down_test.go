@@ -1133,6 +1133,135 @@ func TestProxyHandler_ProxyURLOwnerWithD1BypassesExternalProxyAndStreamsLeaf(t *
 	}
 }
 
+func TestProxyHandler_ProxyURLOwnerWithD1RejectsLeafOpenListLocalURLAfterOwnerRoutingSettles(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		outboundHops []string
+	)
+	localProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		outboundHops = append(outboundHops, r.URL.String())
+		mu.Unlock()
+		_, _ = io.WriteString(w, "recursive-hop-body")
+	}))
+	defer localProxy.Close()
+
+	leafMount := uniqueDownMountPath(t, "leaf-openlist-local")
+	mustCreateNonProxyDownStubStorage(t, leafMount, downStubBehavior{
+		files: []string{downTestFilePath},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			leafPath := leafMount + downTestFilePath
+			localURL := localProxy.URL + "/p" + utils.EncodePath(leafPath, true) + "?type=parsed&sign=" + sign.Sign(leafPath)
+			return &model.Link{URL: localURL}, nil
+		},
+	}, model.Proxy{})
+
+	proxyOwnerMount := uniqueDownMountPath(t, "proxy-owner-local")
+	mustCreateAliasStorage(t, proxyOwnerMount, leafMount, model.Proxy{DownProxyURL: "https://proxy.example.com"})
+
+	resp := callProxyHandlerWithAPI(t, proxyOwnerMount+downTestFilePath, "d=1", localProxy.URL)
+
+	if got, want := resp.Code, http.StatusInternalServerError; got != want {
+		t.Fatalf("expected HTTP %d after rejecting local recursive proxy target, got %d with body %s", want, got, resp.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(outboundHops) != 0 {
+		t.Fatalf("expected no outbound recursive proxy requests, got %v", outboundHops)
+	}
+}
+
+func TestProxyHandler_ProxyURLOwnerWithD1RejectsRootBaseSameHostLocalAPIPath(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		outboundHops []string
+	)
+	localAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		outboundHops = append(outboundHops, r.URL.String())
+		mu.Unlock()
+		_, _ = io.WriteString(w, "root-base-local-hop-body")
+	}))
+	defer localAPI.Close()
+
+	leafMount := uniqueDownMountPath(t, "leaf-root-base-local-api")
+	mustCreateNonProxyDownStubStorage(t, leafMount, downStubBehavior{
+		files: []string{downTestFilePath},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			leafPath := leafMount + downTestFilePath
+			localURL := localAPI.URL + "/api/fs/get?path=" + url.QueryEscape(leafPath)
+			return &model.Link{URL: localURL}, nil
+		},
+	}, model.Proxy{})
+
+	proxyOwnerMount := uniqueDownMountPath(t, "proxy-owner-root-base-local-api")
+	mustCreateAliasStorage(t, proxyOwnerMount, leafMount, model.Proxy{DownProxyURL: "https://proxy.example.com"})
+
+	resp := callProxyHandlerWithAPI(t, proxyOwnerMount+downTestFilePath, "d=1", localAPI.URL)
+
+	if got, want := resp.Code, http.StatusInternalServerError; got != want {
+		t.Fatalf("expected HTTP %d after rejecting root-base same-host local path, got %d with body %s", want, got, resp.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(outboundHops) != 0 {
+		t.Fatalf("expected no outbound recursive proxy requests for root-base same-host local path, got %v", outboundHops)
+	}
+}
+
+func TestProxyHandler_NativeProxyRejectsNeteaseStyleLeafLocalProxyURL(t *testing.T) {
+	textTypesSetting, textTypesExisted := mustGetOrCreateDownSettingItem(t, conf.TextTypes, "")
+	t.Cleanup(func() {
+		if textTypesExisted {
+			mustSaveDownSettingItem(t, textTypesSetting)
+		} else {
+			mustSaveDownSettingItem(t, model.SettingItem{Key: conf.TextTypes, Value: ""})
+		}
+	})
+	if !utils.SliceContains(strings.Split(textTypesSetting.Value, ","), "lrc") {
+		if textTypesSetting.Value == "" {
+			textTypesSetting.Value = "lrc"
+		} else {
+			textTypesSetting.Value += ",lrc"
+		}
+		mustSaveDownSettingItem(t, textTypesSetting)
+	}
+
+	var (
+		mu           sync.Mutex
+		outboundHops []string
+	)
+	localProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		outboundHops = append(outboundHops, r.URL.String())
+		mu.Unlock()
+		_, _ = io.WriteString(w, "netease-recursive-hop-body")
+	}))
+	defer localProxy.Close()
+
+	lyricPath := "/song.lrc"
+	lyricMount := uniqueDownMountPath(t, "netease-lyric")
+	mustCreateNonProxyDownStubStorage(t, lyricMount, downStubBehavior{
+		files: []string{lyricPath},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			leafPath := lyricMount + lyricPath
+			localURL := localProxy.URL + "/p" + utils.EncodePath(leafPath, true) + "?type=parsed&sign=" + sign.Sign(leafPath)
+			return &model.Link{URL: localURL}, nil
+		},
+	}, model.Proxy{})
+
+	resp := callProxyHandlerWithAPI(t, lyricMount+lyricPath, "", localProxy.URL)
+
+	if got, want := resp.Code, http.StatusInternalServerError; got != want {
+		t.Fatalf("expected HTTP %d after rejecting Netease-style local proxy leaf, got %d with body %s", want, got, resp.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(outboundHops) != 0 {
+		t.Fatalf("expected no outbound recursive proxy requests for local lyric leaf, got %v", outboundHops)
+	}
+}
+
 func TestProxyHandler_Redirect302RouteRejectsProxyAccess(t *testing.T) {
 	leafMount := uniqueDownMountPath(t, "leaf")
 	mustCreateNonProxyDownStubStorage(t, leafMount, downStubBehavior{
@@ -1389,6 +1518,55 @@ func TestFsGet_RawURLRedirect302PassesTypeToLeafLink(t *testing.T) {
 	}
 	if got, want := leaf.lastLinkArgs.Type, "preview"; got != want {
 		t.Fatalf("expected leaf Link type %q, got %q", want, got)
+	}
+}
+
+func TestFsGet_RawURLMatchesDownRedirect302ForwardedQueryWhenEnabled(t *testing.T) {
+	forwardSetting, forwardExisted := mustGetOrCreateDownSettingItem(t, conf.ForwardDirectLinkParams, "false")
+	ignoreSetting, ignoreExisted := mustGetOrCreateDownSettingItem(t, conf.IgnoreDirectLinkParams, "sign,openlist_ts,raw")
+	t.Cleanup(func() {
+		if forwardExisted {
+			mustSaveDownSettingItem(t, forwardSetting)
+		} else {
+			mustSaveDownSettingItem(t, model.SettingItem{Key: conf.ForwardDirectLinkParams, Value: "false"})
+		}
+		if ignoreExisted {
+			mustSaveDownSettingItem(t, ignoreSetting)
+		} else {
+			mustSaveDownSettingItem(t, model.SettingItem{Key: conf.IgnoreDirectLinkParams, Value: "sign,openlist_ts,raw"})
+		}
+	})
+
+	forwardSetting.Value = "true"
+	mustSaveDownSettingItem(t, forwardSetting)
+	ignoreSetting.Value = "sign,openlist_ts,raw"
+	mustSaveDownSettingItem(t, ignoreSetting)
+
+	leafMount := uniqueDownMountPath(t, "leaf-forwarded-raw-url")
+	mustCreateNonProxyDownStubStorage(t, leafMount, downStubBehavior{
+		files: []string{downTestFilePath},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/direct.bin?from=leaf"}, nil
+		},
+	}, model.Proxy{})
+
+	outerMount := uniqueDownMountPath(t, "outer-forwarded-raw-url")
+	mustCreateAliasStorage(t, outerMount, leafMount, model.Proxy{})
+
+	query := "token=abc&raw=true"
+	downResp := callDownHandler(t, outerMount+downTestFilePath, query)
+	if got, want := downResp.Code, http.StatusFound; got != want {
+		t.Fatalf("expected /d redirect HTTP %d, got %d with body %s", want, got, downResp.Body.String())
+	}
+
+	expected := "https://download.example.com/direct.bin?from=leaf&token=abc"
+	if got := downResp.Header().Get("Location"); got != expected {
+		t.Fatalf("expected /d redirect location %q, got %q", expected, got)
+	}
+
+	fsGetResp := callFsGetHandlerWithQuery(t, outerMount+downTestFilePath, query)
+	if got := fsGetResp.Data.RawURL; got != expected {
+		t.Fatalf("expected raw_url %q to match /d redirect semantics, got %q", expected, got)
 	}
 }
 
@@ -2247,6 +2425,27 @@ func callFsGetHandlerExpectCodeWithQuery(t *testing.T, reqPath, rawQuery string,
 		t.Fatalf("expected response code %d, got %d with body %s", wantCode, resp.Code, recorder.Body.String())
 	}
 	return resp
+}
+
+func mustGetOrCreateDownSettingItem(t *testing.T, key, defaultValue string) (model.SettingItem, bool) {
+	t.Helper()
+
+	item, err := op.GetSettingItemByKey(key)
+	if err == nil {
+		return *item, true
+	}
+	created := model.SettingItem{Key: key, Value: defaultValue}
+	mustSaveDownSettingItem(t, created)
+	return created, false
+}
+
+func mustSaveDownSettingItem(t *testing.T, item model.SettingItem) {
+	t.Helper()
+
+	copy := item
+	if err := op.SaveSettingItem(&copy); err != nil {
+		t.Fatalf("failed to save setting %q: %v", item.Key, err)
+	}
 }
 
 func mustCreateDownStubStorage(t *testing.T, mountPath string, behavior downStubBehavior, proxy model.Proxy) *downStubDriver {
