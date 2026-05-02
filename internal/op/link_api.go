@@ -291,7 +291,7 @@ func isActualDirectLink(ctx context.Context, storage *model.Storage, resolvedRaw
 	if err != nil || !parsedURL.IsAbs() || parsedURL.Host == "" {
 		return false
 	}
-	if isOpenListLocalURL(ctx, parsedURL) {
+	if IsOpenListLocalURL(ctx, parsedURL) {
 		return false
 	}
 	if isDownProxyDerivedURL(storage, resolvedRawPath, parsedURL) {
@@ -350,24 +350,51 @@ func malformedDownProxyBaseDerivedURL(baseURL *url.URL, resolvedRawPath string, 
 	return strings.HasPrefix(parsedURL.String(), baseURL.String()+utils.EncodePath(resolvedRawPath, true))
 }
 
-func isOpenListLocalURL(ctx context.Context, parsedURL *url.URL) bool {
+func IsOpenListLocalURL(ctx context.Context, parsedURL *url.URL) bool {
 	apiURL, _ := ctx.Value(conf.ApiUrlKey).(string)
-	apiURL = strings.TrimSuffix(apiURL, "/")
-	if apiURL == "" {
+	return IsOpenListLocalURLAgainstAPIURL(apiURL, parsedURL)
+}
+
+func IsOpenListLocalURLAgainstAPIURL(apiURL string, parsedURL *url.URL) bool {
+	if parsedURL == nil || !parsedURL.IsAbs() || parsedURL.Host == "" {
 		return false
 	}
-	parsedAPIURL, err := url.Parse(apiURL)
-	if err != nil || !parsedAPIURL.IsAbs() || parsedAPIURL.Host == "" {
+	parsedAPIURL, apiBasePath, ok := parseOpenListAPIBaseURL(apiURL)
+	if !ok {
 		return false
 	}
 	if !strings.EqualFold(parsedAPIURL.Scheme, parsedURL.Scheme) || !strings.EqualFold(parsedAPIURL.Host, parsedURL.Host) {
 		return false
 	}
-	localPath := utils.FixAndCleanPath(parsedURL.Path)
-	if utils.IsSubPath(utils.FixAndCleanPath(parsedAPIURL.Path), localPath) {
+	return IsOpenListLocalPath(apiBasePath, parsedURL.Path)
+}
+
+func IsOpenListLocalPath(apiBasePath, rawPath string) bool {
+	localPath := utils.FixAndCleanPath(rawPath)
+	if utils.IsSubPath("/p", localPath) || utils.IsSubPath("/d", localPath) {
 		return true
 	}
-	return utils.IsSubPath("/p", localPath) || utils.IsSubPath("/d", localPath)
+	return utils.IsSubPath(joinOpenListAPIPath(apiBasePath), localPath)
+}
+
+func joinOpenListAPIPath(apiBasePath string) string {
+	apiBasePath = utils.FixAndCleanPath(apiBasePath)
+	if apiBasePath == "/" {
+		return "/api"
+	}
+	return apiBasePath + "/api"
+}
+
+func parseOpenListAPIBaseURL(apiURL string) (*url.URL, string, bool) {
+	apiURL = strings.TrimSuffix(apiURL, "/")
+	if apiURL == "" {
+		return nil, "", false
+	}
+	parsedAPIURL, err := url.Parse(apiURL)
+	if err != nil || !parsedAPIURL.IsAbs() || parsedAPIURL.Host == "" {
+		return nil, "", false
+	}
+	return parsedAPIURL, utils.FixAndCleanPath(parsedAPIURL.Path), true
 }
 
 func generateDownProxyURL(storage *model.Storage, reqPath string) (string, error) {

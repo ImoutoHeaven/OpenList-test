@@ -246,28 +246,17 @@ func webDownloadLeafPointsToOpenListLocalRouting(apiURL string, link *model.Link
 		return false
 	}
 	if parsedURL.IsAbs() {
-		parsedAPIURL, err := url.Parse(strings.TrimSuffix(apiURL, "/"))
-		if err != nil || !parsedAPIURL.IsAbs() || parsedAPIURL.Host == "" {
-			return false
-		}
-		if !strings.EqualFold(parsedAPIURL.Scheme, parsedURL.Scheme) || !strings.EqualFold(parsedAPIURL.Host, parsedURL.Host) {
-			return false
-		}
+		return op.IsOpenListLocalURLAgainstAPIURL(apiURL, parsedURL)
 	}
-	return webDownloadPathPointsToOpenListLocalRouting(apiURL, parsedURL.Path)
+	return op.IsOpenListLocalPath(apiURLBasePath(apiURL), parsedURL.Path)
 }
 
-func webDownloadPathPointsToOpenListLocalRouting(apiURL, rawPath string) bool {
-	localPath := utils.FixAndCleanPath(rawPath)
-	if utils.IsSubPath("/p", localPath) || utils.IsSubPath("/d", localPath) {
-		return true
-	}
+func apiURLBasePath(apiURL string) string {
 	parsedAPIURL, err := url.Parse(strings.TrimSuffix(apiURL, "/"))
 	if err != nil {
-		return false
+		return ""
 	}
-	apiBasePath := utils.FixAndCleanPath(parsedAPIURL.Path)
-	return utils.IsSubPath(apiBasePath, localPath)
+	return utils.FixAndCleanPath(parsedAPIURL.Path)
 }
 
 // TODO need optimize

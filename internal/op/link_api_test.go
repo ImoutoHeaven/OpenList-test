@@ -136,6 +136,136 @@ func TestResolveActualLink_FailsWhenLeafReturnsOpenListLocalDURLOutsideAPIBasePr
 	}
 }
 
+func TestResolveActualLink_RejectsRootBaseSameHostOpenListLocalAPIURL(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://example.test/api/fs/get?path=/file.bin"}, nil
+		},
+	})
+
+	ctx := context.WithValue(context.Background(), conf.ApiUrlKey, "https://example.test")
+	_, err := op.ResolveActualLink(ctx, mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns same-host root-base /api URL")
+	}
+}
+
+func TestResolveActualLink_AllowsRootBaseSameHostNonAPIAbsoluteURL(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	const directURL = "https://example.test/files/direct.bin"
+	mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: directURL}, nil
+		},
+	})
+
+	ctx := context.WithValue(context.Background(), conf.ApiUrlKey, "https://example.test")
+	link, err := op.ResolveActualLink(ctx, mountPath+"/file.bin", model.LinkArgs{})
+	if err != nil {
+		t.Fatalf("expected same-host non-API absolute upstream URL to be allowed, got %v", err)
+	}
+	if got := link.URL; got != directURL {
+		t.Fatalf("expected direct URL %q, got %q", directURL, got)
+	}
+}
+
+func TestResolveActualLink_RejectsNonRootBaseSameHostOpenListLocalAPIURL(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://example.test/openlist/api/fs/get?path=/file.bin"}, nil
+		},
+	})
+
+	ctx := context.WithValue(context.Background(), conf.ApiUrlKey, "https://example.test/openlist")
+	_, err := op.ResolveActualLink(ctx, mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns same-host non-root-base /openlist/api URL")
+	}
+}
+
+func TestResolveActualLink_AllowsNonRootBaseSameHostNonAPIAbsoluteURLs(t *testing.T) {
+	t.Run("under_api_base", func(t *testing.T) {
+		mountPath := uniqueMountPath(t, "leaf")
+		const directURL = "https://example.test/openlist/files/direct.bin"
+		mustCreateStubStorage(t, mountPath, stubBehavior{
+			files: []string{"/file.bin"},
+			link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+				return &model.Link{URL: directURL}, nil
+			},
+		})
+
+		ctx := context.WithValue(context.Background(), conf.ApiUrlKey, "https://example.test/openlist")
+		link, err := op.ResolveActualLink(ctx, mountPath+"/file.bin", model.LinkArgs{})
+		if err != nil {
+			t.Fatalf("expected same-host non-API absolute upstream URL under the API base to be allowed, got %v", err)
+		}
+		if got := link.URL; got != directURL {
+			t.Fatalf("expected direct URL %q, got %q", directURL, got)
+		}
+	})
+
+	t.Run("outside_api_base", func(t *testing.T) {
+		mountPath := uniqueMountPath(t, "leaf")
+		const directURL = "https://example.test/files/direct.bin"
+		mustCreateStubStorage(t, mountPath, stubBehavior{
+			files: []string{"/file.bin"},
+			link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+				return &model.Link{URL: directURL}, nil
+			},
+		})
+
+		ctx := context.WithValue(context.Background(), conf.ApiUrlKey, "https://example.test/openlist")
+		link, err := op.ResolveActualLink(ctx, mountPath+"/file.bin", model.LinkArgs{})
+		if err != nil {
+			t.Fatalf("expected same-host non-API absolute upstream URL outside the API base to be allowed, got %v", err)
+		}
+		if got := link.URL; got != directURL {
+			t.Fatalf("expected direct URL %q, got %q", directURL, got)
+		}
+	})
+}
+
+func TestResolveActualLink_RejectsNonRootBaseBalanceSameHostOpenListLocalAPIURL(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://example.test/openlist.balance/api/fs/get?path=/file.bin"}, nil
+		},
+	})
+
+	ctx := context.WithValue(context.Background(), conf.ApiUrlKey, "https://example.test/openlist.balance")
+	_, err := op.ResolveActualLink(ctx, mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns same-host non-root-base /openlist.balance/api URL")
+	}
+}
+
+func TestResolveActualLink_AllowsNonRootBaseBalanceSameHostNonAPIAbsoluteURL(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	const directURL = "https://example.test/openlist.balance/files/direct.bin"
+	mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: directURL}, nil
+		},
+	})
+
+	ctx := context.WithValue(context.Background(), conf.ApiUrlKey, "https://example.test/openlist.balance")
+	link, err := op.ResolveActualLink(ctx, mountPath+"/file.bin", model.LinkArgs{})
+	if err != nil {
+		t.Fatalf("expected same-host non-API absolute upstream URL under .balance API base to be allowed, got %v", err)
+	}
+	if got := link.URL; got != directURL {
+		t.Fatalf("expected direct URL %q, got %q", directURL, got)
+	}
+}
+
 func TestResolveActualLink_FailsWhenLeafReturnsRelativeURL(t *testing.T) {
 	mountPath := uniqueMountPath(t, "leaf")
 	mustCreateStubStorage(t, mountPath, stubBehavior{

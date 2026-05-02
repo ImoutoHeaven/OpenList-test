@@ -1209,6 +1209,128 @@ func TestProxyHandler_ProxyURLOwnerWithD1RejectsRootBaseSameHostLocalAPIPath(t *
 	}
 }
 
+func TestProxyHandler_ProxyURLOwnerWithD1AllowsRootBaseSameHostNonAPIURLAndProxiesOnce(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		outboundHops []string
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		outboundHops = append(outboundHops, r.URL.String())
+		mu.Unlock()
+		_, _ = io.WriteString(w, "root-base-same-host-upstream-body")
+	}))
+	defer upstream.Close()
+
+	leafMount := uniqueDownMountPath(t, "leaf-root-base-same-host-upstream")
+	mustCreateNonProxyDownStubStorage(t, leafMount, downStubBehavior{
+		files: []string{downTestFilePath},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: upstream.URL + "/files/direct.bin"}, nil
+		},
+	}, model.Proxy{})
+
+	proxyOwnerMount := uniqueDownMountPath(t, "proxy-owner-root-base-same-host-upstream")
+	mustCreateAliasStorage(t, proxyOwnerMount, leafMount, model.Proxy{DownProxyURL: "https://proxy.example.com"})
+
+	resp := callProxyHandlerWithAPI(t, proxyOwnerMount+downTestFilePath, "d=1", upstream.URL)
+
+	if got, want := resp.Code, http.StatusOK; got != want {
+		t.Fatalf("expected HTTP %d after proxying same-host non-API URL, got %d with body %s", want, got, resp.Body.String())
+	}
+	if got, want := resp.Body.String(), "root-base-same-host-upstream-body"; got != want {
+		t.Fatalf("expected proxied body %q, got %q", want, got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got, want := len(outboundHops), 1; got != want {
+		t.Fatalf("expected exactly %d outbound proxy request, got %d (%v)", want, got, outboundHops)
+	}
+	if got, want := outboundHops[0], "/files/direct.bin"; got != want {
+		t.Fatalf("expected outbound request path %q, got %q", want, got)
+	}
+}
+
+func TestProxyHandler_ProxyURLOwnerWithD1AllowsNonRootBaseSameHostNonAPIURLUnderAPIBaseAndProxiesOnce(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		outboundHops []string
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		outboundHops = append(outboundHops, r.URL.String())
+		mu.Unlock()
+		_, _ = io.WriteString(w, "non-root-base-same-host-upstream-body")
+	}))
+	defer upstream.Close()
+
+	leafMount := uniqueDownMountPath(t, "leaf-non-root-base-same-host-upstream")
+	mustCreateNonProxyDownStubStorage(t, leafMount, downStubBehavior{
+		files: []string{downTestFilePath},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: upstream.URL + "/openlist/files/direct.bin"}, nil
+		},
+	}, model.Proxy{})
+
+	proxyOwnerMount := uniqueDownMountPath(t, "proxy-owner-non-root-base-same-host-upstream")
+	mustCreateAliasStorage(t, proxyOwnerMount, leafMount, model.Proxy{DownProxyURL: "https://proxy.example.com"})
+
+	resp := callProxyHandlerWithAPI(t, proxyOwnerMount+downTestFilePath, "d=1", upstream.URL+"/openlist")
+
+	if got, want := resp.Code, http.StatusOK; got != want {
+		t.Fatalf("expected HTTP %d after proxying same-host non-API URL under API base, got %d with body %s", want, got, resp.Body.String())
+	}
+	if got, want := resp.Body.String(), "non-root-base-same-host-upstream-body"; got != want {
+		t.Fatalf("expected proxied body %q, got %q", want, got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got, want := len(outboundHops), 1; got != want {
+		t.Fatalf("expected exactly %d outbound proxy request, got %d (%v)", want, got, outboundHops)
+	}
+	if got, want := outboundHops[0], "/openlist/files/direct.bin"; got != want {
+		t.Fatalf("expected outbound request path %q, got %q", want, got)
+	}
+}
+
+func TestProxyHandler_ProxyURLOwnerWithD1RejectsBalanceSameHostLocalAPIPath(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		outboundHops []string
+	)
+	localAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		outboundHops = append(outboundHops, r.URL.String())
+		mu.Unlock()
+		_, _ = io.WriteString(w, "balance-local-hop-body")
+	}))
+	defer localAPI.Close()
+
+	leafMount := uniqueDownMountPath(t, "leaf-balance-local-api")
+	mustCreateNonProxyDownStubStorage(t, leafMount, downStubBehavior{
+		files: []string{downTestFilePath},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			leafPath := leafMount + downTestFilePath
+			localURL := localAPI.URL + "/openlist.balance/api/fs/get?path=" + url.QueryEscape(leafPath)
+			return &model.Link{URL: localURL}, nil
+		},
+	}, model.Proxy{})
+
+	proxyOwnerMount := uniqueDownMountPath(t, "proxy-owner-balance-local-api")
+	mustCreateAliasStorage(t, proxyOwnerMount, leafMount, model.Proxy{DownProxyURL: "https://proxy.example.com"})
+
+	resp := callProxyHandlerWithAPI(t, proxyOwnerMount+downTestFilePath, "d=1", localAPI.URL+"/openlist.balance")
+
+	if got, want := resp.Code, http.StatusInternalServerError; got != want {
+		t.Fatalf("expected HTTP %d after rejecting .balance recursive proxy target, got %d with body %s", want, got, resp.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(outboundHops) != 0 {
+		t.Fatalf("expected no outbound recursive proxy requests, got %v", outboundHops)
+	}
+}
+
 func TestProxyHandler_NativeProxyRejectsNeteaseStyleLeafLocalProxyURL(t *testing.T) {
 	textTypesSetting, textTypesExisted := mustGetOrCreateDownSettingItem(t, conf.TextTypes, "")
 	t.Cleanup(func() {
