@@ -374,7 +374,14 @@ func IsOpenListLocalPath(apiBasePath, rawPath string) bool {
 	if utils.IsSubPath("/p", localPath) || utils.IsSubPath("/d", localPath) {
 		return true
 	}
-	return utils.IsSubPath(joinOpenListAPIPath(apiBasePath), localPath)
+	apiBasePath = utils.FixAndCleanPath(apiBasePath)
+	if utils.IsSubPath(joinOpenListAPIPath(apiBasePath), localPath) {
+		return true
+	}
+	if apiBasePath == "/" {
+		return false
+	}
+	return utils.IsSubPath(apiBasePath+"/p", localPath) || utils.IsSubPath(apiBasePath+"/d", localPath)
 }
 
 func joinOpenListAPIPath(apiBasePath string) string {
