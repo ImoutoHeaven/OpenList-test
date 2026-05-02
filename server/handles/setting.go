@@ -57,6 +57,8 @@ func SaveSettings(c *gin.Context) {
 	if err := op.SaveSettingItems(req); err != nil {
 		common.ErrorResp(c, err, 500)
 	} else {
+		sign.Instance()
+		op.RefreshLinkAPISigner()
 		common.SuccessResp(c)
 		static.UpdateIndex()
 	}

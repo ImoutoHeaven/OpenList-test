@@ -22,7 +22,7 @@ func get(ctx context.Context, path string, args *GetArgs) (model.Obj, error) {
 			}
 		}
 	}
-	storage, actualPath, err := op.GetStorageAndActualPath(path)
+	storage, actualPath, err := op.GetStorageAndActualPathByContext(ctx, path)
 	if err != nil {
 		// if there are no storage prefix with path, maybe root folder
 		if path == "/" {

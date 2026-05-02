@@ -1,18 +1,11 @@
 package middlewares
 
 import (
-	"strings"
-
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
-	"github.com/OpenListTeam/OpenList/v4/internal/setting"
-
-	"github.com/OpenListTeam/OpenList/v4/internal/errs"
-	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
-	"github.com/pkg/errors"
+	"strings"
 )
 
 func PathParse(c *gin.Context) {
@@ -24,16 +17,14 @@ func PathParse(c *gin.Context) {
 func Down(verifyFunc func(string, string) error) func(c *gin.Context) {
 	return func(c *gin.Context) {
 		rawPath := c.Request.Context().Value(conf.PathKey).(string)
-		meta, err := op.GetNearestMeta(rawPath)
-		if err != nil {
-			if !errors.Is(errors.Cause(err), errs.MetaNotFound) {
-				common.ErrorPage(c, err, 500, true)
-				return
-			}
-		}
-		common.GinWithValue(c, conf.MetaKey, meta)
 		// verify sign
-		if needSign(meta, rawPath) {
+		ctx, needSign, err := common.IsPathSignRequiredForRequest(c.Request.Context(), rawPath)
+		if err != nil {
+			common.ErrorPage(c, err, 500, true)
+			return
+		}
+		c.Request = c.Request.WithContext(ctx)
+		if needSign {
 			s := c.Query("sign")
 			err = verifyFunc(rawPath, strings.TrimSuffix(s, "/"))
 			if err != nil {
@@ -50,20 +41,4 @@ func Down(verifyFunc func(string, string) error) func(c *gin.Context) {
 // path maybe contains # ? etc.
 func parsePath(path string) string {
 	return utils.FixAndCleanPath(path)
-}
-
-func needSign(meta *model.Meta, path string) bool {
-	if setting.GetBool(conf.SignAll) {
-		return true
-	}
-	if common.IsStorageSignEnabled(path) {
-		return true
-	}
-	if meta == nil || meta.Password == "" {
-		return false
-	}
-	if !meta.PSub && path != meta.Path {
-		return false
-	}
-	return true
 }

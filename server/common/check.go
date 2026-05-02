@@ -1,20 +1,75 @@
 package common
 
 import (
+	"context"
 	"path"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/dlclark/regexp2"
+	perrors "github.com/pkg/errors"
 )
 
 func IsStorageSignEnabled(rawPath string) bool {
-	storage := op.GetBalancedStorage(rawPath)
+	storage := op.PeekBalancedStorage(rawPath)
 	return storage != nil && storage.GetStorage().EnableSign
+}
+
+func IsStorageSignEnabledForRequest(ctx context.Context, rawPath string) bool {
+	rawPath = utils.FixAndCleanPath(rawPath)
+	ctx = op.EnsureLinkAPIBalanceStateForRequest(ctx)
+	storage := op.ResolveLinkAPIStorageForSignCheck(ctx, rawPath)
+	return storage != nil && storage.GetStorage().EnableSign
+}
+
+func IsPathSignRequired(rawPath string) (bool, error) {
+	rawPath = utils.FixAndCleanPath(rawPath)
+	return isPathSignRequiredForStorage(rawPath, op.PeekBalancedStorage(rawPath))
+}
+
+func IsPathSignRequiredForStorage(rawPath string, storage driver.Driver) (bool, error) {
+	rawPath = utils.FixAndCleanPath(rawPath)
+	return isPathSignRequiredForStorage(rawPath, storage)
+}
+
+func isPathSignRequiredForStorage(rawPath string, storage driver.Driver) (bool, error) {
+	if setting.GetBool(conf.SignAll) {
+		return true, nil
+	}
+	if storage != nil && storage.GetStorage().EnableSign {
+		return true, nil
+	}
+	meta, err := op.GetNearestMeta(rawPath)
+	if err != nil {
+		if perrors.Is(perrors.Cause(err), errs.MetaNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return MetaRequiresSign(meta, rawPath), nil
+}
+
+func IsPathSignRequiredForRequest(ctx context.Context, rawPath string) (context.Context, bool, error) {
+	rawPath = utils.FixAndCleanPath(rawPath)
+	ctx = op.EnsureLinkAPIBalanceStateForRequest(ctx)
+	needSign, err := isPathSignRequiredForStorage(rawPath, op.ResolveLinkAPIStorageForSignCheck(ctx, rawPath))
+	return ctx, needSign, err
+}
+
+func MetaRequiresSign(meta *model.Meta, rawPath string) bool {
+	if meta == nil || meta.Password == "" {
+		return false
+	}
+	if !meta.PSub && !utils.PathEqual(meta.Path, rawPath) {
+		return false
+	}
+	return true
 }
 
 func CanWrite(meta *model.Meta, path string) bool {

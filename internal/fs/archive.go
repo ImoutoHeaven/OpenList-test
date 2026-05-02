@@ -335,7 +335,7 @@ var ArchiveContentUploadTaskManager = &archiveContentUploadTaskManagerType{
 }
 
 func archiveMeta(ctx context.Context, path string, args model.ArchiveMetaArgs) (*model.ArchiveMetaProvider, error) {
-	storage, actualPath, err := op.GetStorageAndActualPath(path)
+	storage, actualPath, err := op.GetStorageAndActualPathByContext(ctx, path)
 	if err != nil {
 		return nil, errors.WithMessage(err, "failed get storage")
 	}
@@ -343,7 +343,7 @@ func archiveMeta(ctx context.Context, path string, args model.ArchiveMetaArgs) (
 }
 
 func archiveList(ctx context.Context, path string, args model.ArchiveListArgs) ([]model.Obj, error) {
-	storage, actualPath, err := op.GetStorageAndActualPath(path)
+	storage, actualPath, err := op.GetStorageAndActualPathByContext(ctx, path)
 	if err != nil {
 		return nil, errors.WithMessage(err, "failed get storage")
 	}
@@ -401,7 +401,7 @@ func archiveDecompress(ctx context.Context, srcObjPath, dstDirPath string, args 
 }
 
 func archiveDriverExtract(ctx context.Context, path string, args model.ArchiveInnerArgs) (*model.Link, model.Obj, error) {
-	storage, actualPath, err := op.GetStorageAndActualPath(path)
+	storage, actualPath, err := op.GetStorageAndActualPathByContext(ctx, path)
 	if err != nil {
 		return nil, nil, errors.WithMessage(err, "failed get storage")
 	}
@@ -409,7 +409,7 @@ func archiveDriverExtract(ctx context.Context, path string, args model.ArchiveIn
 }
 
 func archiveInternalExtract(ctx context.Context, path string, args model.ArchiveInnerArgs) (io.ReadCloser, int64, error) {
-	storage, actualPath, err := op.GetStorageAndActualPath(path)
+	storage, actualPath, err := op.GetStorageAndActualPathByContext(ctx, path)
 	if err != nil {
 		return nil, 0, errors.WithMessage(err, "failed get storage")
 	}

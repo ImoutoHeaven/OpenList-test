@@ -1,6 +1,7 @@
 package handles
 
 import (
+	"context"
 	"fmt"
 	stdpath "path"
 	"strings"
@@ -12,7 +13,6 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
-	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
@@ -214,6 +214,19 @@ func isEncrypt(meta *model.Meta, path string) bool {
 	return true
 }
 
+func isEncryptForRequest(ctx context.Context, meta *model.Meta, path string) bool {
+	if common.IsStorageSignEnabledForRequest(ctx, path) {
+		return true
+	}
+	if meta == nil || meta.Password == "" {
+		return false
+	}
+	if !utils.PathEqual(meta.Path, path) && !meta.PSub {
+		return false
+	}
+	return true
+}
+
 func pagination(objs []model.Obj, req *model.PageReq) (int, []model.Obj) {
 	pageIndex, pageSize := req.Page, req.PerPage
 	total := len(objs)
@@ -303,7 +316,8 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 		common.ErrorStrResp(c, "password is incorrect or you have no permission", 403)
 		return
 	}
-	obj, err := fs.Get(c.Request.Context(), reqPath, &fs.GetArgs{
+	ctx := op.EnsureLinkAPIBalanceStateForRequest(c.Request.Context())
+	obj, err := fs.Get(ctx, reqPath, &fs.GetArgs{
 		WithStorageDetails: !user.IsGuest() && !setting.GetBool(conf.HideStorageDetails),
 	})
 	if err != nil {
@@ -312,7 +326,7 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 	}
 	var rawURL string
 
-	storage, err := fs.GetStorage(reqPath, &fs.GetStoragesArgs{})
+	storage, err := fs.GetStorageWithContext(ctx, reqPath, &fs.GetStoragesArgs{})
 	provider, ok := model.GetProvider(obj)
 	if !ok && err == nil {
 		provider = storage.Config().Name
@@ -322,45 +336,56 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 			common.ErrorResp(c, err, 500)
 			return
 		}
-		if storage.Config().MustProxy() || storage.GetStorage().WebProxy {
-			rawURL = common.GenerateDownProxyURL(storage.GetStorage(), reqPath)
-			if rawURL == "" {
-				query := ""
-				if isEncrypt(meta, reqPath) || setting.GetBool(conf.SignAll) {
-					query = "?sign=" + sign.Sign(reqPath)
-				}
-				rawURL = fmt.Sprintf("%s/p%s%s",
-					common.GetApiUrl(c),
-					utils.EncodePath(reqPath, true),
-					query)
+		route, err := op.ResolveWebDownloadRoute(ctx, reqPath)
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+		switch route.EffectivePolicy {
+		case op.WebDownloadProxyURL:
+			rawURL, err = op.WebDownloadExternalProxyURL(route)
+			if err != nil {
+				common.ErrorResp(c, err, 500)
+				return
 			}
-		} else {
-			// file have raw url
-			if url, ok := model.GetUrl(obj); ok {
-				rawURL = url
-			} else {
-				// if storage is not proxy, use raw url by fs.Link
-				link, _, err := fs.Link(c.Request.Context(), reqPath, model.LinkArgs{
-					IP:       c.ClientIP(),
-					Header:   c.Request.Header,
-					Redirect: true,
-				})
-				if err != nil {
-					common.ErrorResp(c, err, 500)
-					return
-				}
-				defer link.Close()
-				rawURL = link.URL
+		case op.WebDownloadNativeProxy:
+			needSign, err := common.IsPathSignRequired(route.PolicyOwnerRawPath)
+			if err != nil {
+				common.ErrorResp(c, err, 500)
+				return
 			}
+			rawURL, err = op.WebDownloadCanonicalProxyURL(common.GetApiUrl(c.Request.Context()), route, webDownloadTypeQuery(c), needSign)
+			if err != nil {
+				common.ErrorResp(c, err, 500)
+				return
+			}
+		case op.WebDownloadRedirect302:
+			link, _, err := op.WebDownloadLeafDirectLink(ctx, route, model.LinkArgs{
+				IP:       c.ClientIP(),
+				Header:   c.Request.Header,
+				Type:     c.Query("type"),
+				Redirect: true,
+			})
+			if err != nil {
+				common.ErrorResp(c, err, 500)
+				return
+			}
+			defer link.Close()
+			rawURL = link.URL
+		default:
+			common.ErrorResp(c, fmt.Errorf("unsupported web download policy %q", route.EffectivePolicy), 500)
+			return
 		}
 	}
 	var related []model.Obj
 	parentPath := stdpath.Dir(reqPath)
-	sameLevelFiles, err := fs.List(c.Request.Context(), parentPath, &fs.ListArgs{})
+	sameLevelFiles, err := fs.List(ctx, parentPath, &fs.ListArgs{})
 	if err == nil {
 		related = filterRelated(sameLevelFiles, obj)
 	}
 	parentMeta, _ := op.GetNearestMeta(parentPath)
+	currentEncrypt := isEncryptForRequest(ctx, meta, reqPath)
+	parentEncrypt := isEncryptForRequest(ctx, parentMeta, parentPath)
 	thumb, _ := model.GetThumb(obj)
 	mountDetails, _ := model.GetStorageDetails(obj)
 	common.SuccessResp(c, FsGetResp{
@@ -374,7 +399,7 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 			Created:      obj.CreateTime(),
 			HashInfoStr:  obj.GetHash().String(),
 			HashInfo:     obj.GetHash().Export(),
-			Sign:         common.Sign(obj, parentPath, isEncrypt(meta, reqPath)),
+			Sign:         common.Sign(obj, parentPath, currentEncrypt),
 			Type:         utils.GetFileType(obj.GetName()),
 			Thumb:        thumb,
 			MountDetails: mountDetails,
@@ -383,7 +408,7 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 		Readme:   getReadme(meta, reqPath),
 		Header:   getHeader(meta, reqPath),
 		Provider: provider,
-		Related:  toObjsResp(related, parentPath, isEncrypt(parentMeta, parentPath)),
+		Related:  toObjsResp(related, parentPath, parentEncrypt),
 	})
 }
 

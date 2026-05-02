@@ -6,7 +6,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -28,10 +27,6 @@ type linkAPIBalanceState struct {
 
 type linkAPIBalanceStateKey struct{}
 type linkAPIProbeSeenKey struct{}
-
-var linkAPISignerMu sync.Mutex
-var linkAPISignerOnce sync.Once
-var linkAPISigner pkgsign.Sign
 
 func HasLinkAPIStorage(rawPath string) bool {
 	rawPath = utils.FixAndCleanPath(rawPath)
@@ -96,6 +91,10 @@ func ensureLinkAPIBalanceState(ctx context.Context, reserveBalanceOnProbe bool) 
 		pinnedMountPath:       map[string]string{},
 		reserveBalanceOnProbe: reserveBalanceOnProbe,
 	})
+}
+
+func EnsureLinkAPIBalanceStateForRequest(ctx context.Context) context.Context {
+	return ensureLinkAPIBalanceState(ctx, true)
 }
 
 func getLinkAPIBalanceState(ctx context.Context) *linkAPIBalanceState {
@@ -213,6 +212,11 @@ func getLinkAPIStorage(ctx context.Context, path string, advanceBalance bool) dr
 	}
 }
 
+func ResolveLinkAPIStorageForSignCheck(ctx context.Context, rawPath string) driver.Driver {
+	rawPath = utils.FixAndCleanPath(rawPath)
+	return getLinkAPIStorage(ctx, rawPath, false)
+}
+
 func ResolveActualStoragePath(ctx context.Context, rawPath string) (driver.Driver, string, string, error) {
 	ctx = ensureLinkAPIBalanceState(ctx, true)
 	return resolveActualStoragePath(ctx, utils.FixAndCleanPath(rawPath), map[string]struct{}{})
@@ -245,7 +249,7 @@ func resolveActualStoragePath(ctx context.Context, rawPath string, seen map[stri
 }
 
 func ResolveActualLink(ctx context.Context, rawPath string, args model.LinkArgs) (*model.Link, error) {
-	storage, actualPath, resolvedRawPath, err := ResolveActualStoragePath(ctx, rawPath)
+	storage, actualPath, resolvedVirtualRawPath, err := ResolveActualStoragePath(ctx, rawPath)
 	if err != nil {
 		return nil, err
 	}
@@ -267,23 +271,19 @@ func ResolveActualLink(ctx context.Context, rawPath string, args model.LinkArgs)
 	if err != nil {
 		return nil, err
 	}
-	if isActualDirectLink(ctx, link) {
+	resolvedConcreteRawPath := webDownloadConcreteRawPath(storage.GetStorage().MountPath, actualPath)
+	if isActualDirectLink(ctx, storage.GetStorage(), resolvedConcreteRawPath, link, resolvedVirtualRawPath) {
 		return link, nil
 	}
 	closeLink(link)
 
-	downProxyURL := generateDownProxyURL(storage.GetStorage(), resolvedRawPath)
-	if downProxyURL != "" {
-		return &model.Link{URL: downProxyURL}, nil
-	}
-
 	return nil, errs.NewErr(errs.NotSupport,
-		"storage %s cannot provide an external downloadable URL for %s",
-		storage.GetStorage().MountPath, resolvedRawPath,
+		"storage %s cannot provide a real upstream downloadable URL for %s",
+		storage.GetStorage().MountPath, rawPath,
 	)
 }
 
-func isActualDirectLink(ctx context.Context, link *model.Link) bool {
+func isActualDirectLink(ctx context.Context, storage *model.Storage, resolvedRawPath string, link *model.Link, additionalRawPaths ...string) bool {
 	if link == nil || link.URL == "" {
 		return false
 	}
@@ -291,7 +291,63 @@ func isActualDirectLink(ctx context.Context, link *model.Link) bool {
 	if err != nil || !parsedURL.IsAbs() || parsedURL.Host == "" {
 		return false
 	}
-	return !isOpenListLocalURL(ctx, parsedURL)
+	if isOpenListLocalURL(ctx, parsedURL) {
+		return false
+	}
+	if isDownProxyDerivedURL(storage, resolvedRawPath, parsedURL) {
+		return false
+	}
+	for _, rawPath := range additionalRawPaths {
+		if utils.FixAndCleanPath(rawPath) == utils.FixAndCleanPath(resolvedRawPath) {
+			continue
+		}
+		if isDownProxyDerivedURL(storage, rawPath, parsedURL) {
+			return false
+		}
+	}
+	return true
+}
+
+func isDownProxyDerivedURL(storage *model.Storage, resolvedRawPath string, parsedURL *url.URL) bool {
+	if storage == nil || storage.DownProxyURL == "" {
+		return false
+	}
+	baseURL := strings.Split(storage.DownProxyURL, "\n")[0]
+	parsedBaseURL, err := url.Parse(baseURL)
+	if err != nil || !parsedBaseURL.IsAbs() || parsedBaseURL.Host == "" {
+		return false
+	}
+	if !strings.EqualFold(parsedBaseURL.Scheme, parsedURL.Scheme) || !strings.EqualFold(parsedBaseURL.Host, parsedURL.Host) {
+		return false
+	}
+	if malformedDownProxyBaseDerivedURL(parsedBaseURL, resolvedRawPath, parsedURL) {
+		return true
+	}
+	generatedURL, err := generateDownProxyURL(storage, resolvedRawPath)
+	if err != nil || generatedURL == "" {
+		return false
+	}
+	generatedParsedURL, err := url.Parse(generatedURL)
+	if err != nil || !generatedParsedURL.IsAbs() || generatedParsedURL.Host == "" {
+		return false
+	}
+	if !strings.EqualFold(generatedParsedURL.Scheme, parsedURL.Scheme) || !strings.EqualFold(generatedParsedURL.Host, parsedURL.Host) {
+		return false
+	}
+	if generatedParsedURL.Path != parsedURL.Path {
+		return false
+	}
+	return true
+}
+
+func malformedDownProxyBaseDerivedURL(baseURL *url.URL, resolvedRawPath string, parsedURL *url.URL) bool {
+	if baseURL == nil {
+		return false
+	}
+	if baseURL.RawQuery == "" && baseURL.Fragment == "" {
+		return false
+	}
+	return strings.HasPrefix(parsedURL.String(), baseURL.String()+utils.EncodePath(resolvedRawPath, true))
 }
 
 func isOpenListLocalURL(ctx context.Context, parsedURL *url.URL) bool {
@@ -307,52 +363,49 @@ func isOpenListLocalURL(ctx context.Context, parsedURL *url.URL) bool {
 	if !strings.EqualFold(parsedAPIURL.Scheme, parsedURL.Scheme) || !strings.EqualFold(parsedAPIURL.Host, parsedURL.Host) {
 		return false
 	}
-	return utils.IsSubPath(utils.FixAndCleanPath(parsedAPIURL.Path), utils.FixAndCleanPath(parsedURL.Path))
+	localPath := utils.FixAndCleanPath(parsedURL.Path)
+	if utils.IsSubPath(utils.FixAndCleanPath(parsedAPIURL.Path), localPath) {
+		return true
+	}
+	return utils.IsSubPath("/p", localPath) || utils.IsSubPath("/d", localPath)
 }
 
-func generateDownProxyURL(storage *model.Storage, reqPath string) string {
-	if storage.DownProxyURL == "" {
-		return ""
+func generateDownProxyURL(storage *model.Storage, reqPath string) (string, error) {
+	if storage == nil || storage.DownProxyURL == "" {
+		return "", nil
+	}
+	baseURL := strings.Split(storage.DownProxyURL, "\n")[0]
+	parsedBaseURL, err := url.Parse(baseURL)
+	if err != nil || !parsedBaseURL.IsAbs() || parsedBaseURL.Host == "" || parsedBaseURL.RawQuery != "" || parsedBaseURL.Fragment != "" {
+		return "", fmt.Errorf("storage %s has invalid external down_proxy_url %q", storage.MountPath, baseURL)
 	}
 	query := ""
 	if !storage.DisableProxySign {
 		query = "?sign=" + signDownProxyPath(reqPath)
 	}
-	return fmt.Sprintf("%s%s%s",
-		strings.Split(storage.DownProxyURL, "\n")[0],
+	generatedURL := fmt.Sprintf("%s%s%s",
+		baseURL,
 		utils.EncodePath(reqPath, true),
 		query,
 	)
+	parsedGeneratedURL, err := url.Parse(generatedURL)
+	if err != nil || !parsedGeneratedURL.IsAbs() || parsedGeneratedURL.Host == "" {
+		return "", fmt.Errorf("storage %s has invalid external down_proxy_url %q", storage.MountPath, baseURL)
+	}
+	return generatedURL, nil
 }
 
 func signDownProxyPath(data string) string {
-	linkAPISignerOnce.Do(initLinkAPISigner)
 	expire := getSettingInt(conf.LinkExpiration)
 	expireAt := int64(0)
 	if expire > 0 {
 		expireAt = time.Now().Add(time.Duration(expire) * time.Hour).Unix()
 	}
-	return linkAPISigner.Sign(data, expireAt)
+	return newLinkAPISigner().Sign(data, expireAt)
 }
 
 func RefreshLinkAPISigner() {
-	linkAPISignerMu.Lock()
-	defer linkAPISignerMu.Unlock()
-	linkAPISigner = newLinkAPISigner()
-	linkAPISignerOnce = sync.Once{}
-	linkAPISignerOnce.Do(func() {
-		if linkAPISigner == nil {
-			linkAPISigner = newLinkAPISigner()
-		}
-	})
-}
-
-func initLinkAPISigner() {
-	linkAPISignerMu.Lock()
-	defer linkAPISignerMu.Unlock()
-	if linkAPISigner == nil {
-		linkAPISigner = newLinkAPISigner()
-	}
+	// No cached signer remains in internal/op; signer state is derived per call.
 }
 
 func newLinkAPISigner() pkgsign.Sign {

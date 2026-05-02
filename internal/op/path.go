@@ -1,6 +1,7 @@
 package op
 
 import (
+	"context"
 	stdpath "path"
 	"strings"
 
@@ -14,8 +15,12 @@ import (
 // GetStorageAndActualPath Get the corresponding storage and actual path
 // for path: remove the mount path prefix and join the actual root folder if exists
 func GetStorageAndActualPath(rawPath string) (storage driver.Driver, actualPath string, err error) {
+	return GetStorageAndActualPathByContext(context.Background(), rawPath)
+}
+
+func GetStorageAndActualPathByContext(ctx context.Context, rawPath string) (storage driver.Driver, actualPath string, err error) {
 	rawPath = utils.FixAndCleanPath(rawPath)
-	storage = GetBalancedStorage(rawPath)
+	storage, actualPath, err = getLinkAPIStorageAndActualPath(ctx, rawPath, true)
 	if storage == nil {
 		if rawPath == "/" {
 			err = errs.NewErr(errs.StorageNotFound, "please add a storage first")
@@ -25,8 +30,6 @@ func GetStorageAndActualPath(rawPath string) (storage driver.Driver, actualPath 
 		return
 	}
 	log.Debugln("use storage: ", storage.GetStorage().MountPath)
-	mountPath := utils.GetActualMountPath(storage.GetStorage().MountPath)
-	actualPath = utils.FixAndCleanPath(strings.TrimPrefix(rawPath, mountPath))
 	return
 }
 

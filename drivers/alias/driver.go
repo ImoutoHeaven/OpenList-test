@@ -94,7 +94,7 @@ func (d *Alias) Get(ctx context.Context, path string) (model.Obj, error) {
 		if err != nil {
 			continue
 		}
-		storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
+		storage, err := fs.GetStorageWithContext(ctx, rawPath, &fs.GetStoragesArgs{})
 		if ret == nil {
 			ret = &model.Object{
 				Path:     path,

@@ -442,6 +442,29 @@ func GetBalancedStorage(path string) driver.Driver {
 	}
 }
 
+// PeekBalancedStorage returns the next authoritative balance choice without mutating balance state.
+func PeekBalancedStorage(path string) driver.Driver {
+	path = utils.FixAndCleanPath(path)
+	storages := getStoragesByPath(path)
+	storageNum := len(storages)
+	switch storageNum {
+	case 0:
+		return nil
+	case 1:
+		return storages[0]
+	default:
+		virtualPath := utils.GetActualMountPath(storages[0].GetStorage().MountPath)
+		balanceMu.Lock()
+		defer balanceMu.Unlock()
+		i, ok := balanceMap.Load(virtualPath)
+		if !ok {
+			i = 0
+		}
+		next := (i + 1) % storageNum
+		return storages[next]
+	}
+}
+
 func GetStorageDetails(ctx context.Context, storage driver.Driver) (*model.StorageDetails, error) {
 	wd, ok := storage.(driver.WithDetails)
 	if !ok {

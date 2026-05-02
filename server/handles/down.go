@@ -4,14 +4,14 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	stdpath "path"
+	"net/url"
 	"strconv"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
-	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/net"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
@@ -23,17 +23,28 @@ import (
 
 func Down(c *gin.Context) {
 	rawPath := c.Request.Context().Value(conf.PathKey).(string)
-	filename := stdpath.Base(rawPath)
-	storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
+	route, err := op.ResolveWebDownloadRoute(c.Request.Context(), rawPath)
 	if err != nil {
 		common.ErrorPage(c, err, 500)
 		return
 	}
-	if common.ShouldProxy(storage, filename) {
-		Proxy(c)
-		return
-	} else {
-		link, _, err := fs.Link(c.Request.Context(), rawPath, model.LinkArgs{
+	switch route.EffectivePolicy {
+	case op.WebDownloadProxyURL:
+		redirectURL, err := externalOwnerProxyURL(route)
+		if err != nil {
+			common.ErrorPage(c, err, 500)
+			return
+		}
+		c.Redirect(302, redirectURL)
+	case op.WebDownloadNativeProxy:
+		redirectURL, err := canonicalOwnerProxyURL(c, route, c.Request.URL.Query())
+		if err != nil {
+			common.ErrorPage(c, err, 500)
+			return
+		}
+		c.Redirect(302, redirectURL)
+	case op.WebDownloadRedirect302:
+		link, _, err := op.WebDownloadLeafDirectLink(c.Request.Context(), route, model.LinkArgs{
 			IP:       c.ClientIP(),
 			Header:   c.Request.Header,
 			Type:     c.Query("type"),
@@ -44,37 +55,96 @@ func Down(c *gin.Context) {
 			return
 		}
 		redirect(c, link)
+	default:
+		common.ErrorPage(c, fmt.Errorf("unsupported web download policy %q", route.EffectivePolicy), 500)
 	}
 }
 
 func Proxy(c *gin.Context) {
 	rawPath := c.Request.Context().Value(conf.PathKey).(string)
-	filename := stdpath.Base(rawPath)
-	storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
+	route, err := op.ResolveWebDownloadRoute(c.Request.Context(), rawPath)
 	if err != nil {
 		common.ErrorPage(c, err, 500)
 		return
 	}
-	if canProxy(storage, filename) {
-		if _, ok := c.GetQuery("d"); !ok {
-			if url := common.GenerateDownProxyURL(storage.GetStorage(), rawPath); url != "" {
-				c.Redirect(302, url)
-				return
-			}
-		}
-		link, file, err := fs.Link(c.Request.Context(), rawPath, model.LinkArgs{
-			Header: c.Request.Header,
-			Type:   c.Query("type"),
-		})
-		if err != nil {
-			common.ErrorPage(c, err, 500)
-			return
-		}
-		proxy(c, link, file, storage.GetStorage().ProxyRange)
-	} else {
+	query := c.Request.URL.Query()
+	bypassExternalProxy := query.Get("d") == "1"
+	currentPath := utils.FixAndCleanPath(rawPath)
+	ownerPath := utils.FixAndCleanPath(route.PolicyOwnerRawPath)
+
+	switch route.EffectivePolicy {
+	case op.WebDownloadRedirect302:
 		common.ErrorPage(c, errors.New("proxy not allowed"), 403)
 		return
+	case op.WebDownloadProxyURL:
+		if !bypassExternalProxy {
+			redirectURL, err := externalOwnerProxyURL(route)
+			if err != nil {
+				common.ErrorPage(c, err, 500)
+				return
+			}
+			c.Redirect(302, redirectURL)
+			return
+		}
+		if currentPath != ownerPath {
+			redirectURL, err := canonicalOwnerProxyURL(c, route, query)
+			if err != nil {
+				common.ErrorPage(c, err, 500)
+				return
+			}
+			c.Redirect(302, redirectURL)
+			return
+		}
+	case op.WebDownloadNativeProxy:
+		if currentPath != ownerPath {
+			redirectURL, err := canonicalOwnerProxyURL(c, route, query)
+			if err != nil {
+				common.ErrorPage(c, err, 500)
+				return
+			}
+			c.Redirect(302, redirectURL)
+			return
+		}
+	default:
+		common.ErrorPage(c, fmt.Errorf("unsupported web download policy %q", route.EffectivePolicy), 500)
+		return
 	}
+
+	link, file, err := op.WebDownloadLeafLink(c.Request.Context(), route, model.LinkArgs{
+		Header: c.Request.Header,
+		Type:   c.Query("type"),
+	})
+	if err != nil {
+		common.ErrorPage(c, err, 500)
+		return
+	}
+	proxy(c, link, file, webDownloadProxyRange(route))
+}
+
+func canonicalOwnerProxyURL(c *gin.Context, route *op.WebDownloadRoute, query url.Values) (string, error) {
+	needSign, err := common.IsPathSignRequired(route.PolicyOwnerRawPath)
+	if err != nil {
+		return "", err
+	}
+	return op.WebDownloadCanonicalProxyURL(common.GetApiUrl(c.Request.Context()), route, query, needSign)
+}
+
+func externalOwnerProxyURL(route *op.WebDownloadRoute) (string, error) {
+	return op.WebDownloadExternalProxyURL(route)
+}
+
+func webDownloadTypeQuery(c *gin.Context) url.Values {
+	if c == nil || c.Query("type") == "" {
+		return nil
+	}
+	return url.Values{"type": {c.Query("type")}}
+}
+
+func webDownloadProxyRange(route *op.WebDownloadRoute) bool {
+	if route == nil || route.PolicyOwnerStorage == nil {
+		return false
+	}
+	return route.PolicyOwnerStorage.GetStorage().ProxyRange
 }
 
 func redirect(c *gin.Context, link *model.Link) {

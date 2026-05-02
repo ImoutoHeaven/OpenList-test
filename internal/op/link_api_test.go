@@ -60,9 +60,9 @@ func TestResolveActualLink_PrefersLeafDirectURLOverDownProxyURL(t *testing.T) {
 	}
 }
 
-func TestResolveActualLink_UsesLeafDownProxyURLWhenLeafHasNoDirectURL(t *testing.T) {
+func TestResolveActualLink_FailsWhenLeafHasNoRealUpstreamURL(t *testing.T) {
 	mountPath := uniqueMountPath(t, "leaf")
-	leaf := mustCreateStubStorage(t, mountPath, stubBehavior{
+	mustCreateStubStorage(t, mountPath, stubBehavior{
 		files: []string{"/file.bin"},
 		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
 			return &model.Link{
@@ -75,22 +75,15 @@ func TestResolveActualLink_UsesLeafDownProxyURLWhenLeafHasNoDirectURL(t *testing
 		disableProxySign: true,
 	})
 
-	link, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
-	if err != nil {
-		t.Fatalf("expected success, got error: %v", err)
-	}
-
-	if got, want := link.URL, common.GenerateDownProxyURL(leaf.GetStorage(), mountPath+"/file.bin"); got != want {
-		t.Fatalf("expected down_proxy_url %q, got %q", want, got)
-	}
-	if got := len(link.Header); got != 0 {
-		t.Fatalf("expected empty headers on down_proxy_url fallback, got %v", link.Header)
+	_, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf has no real upstream URL")
 	}
 }
 
-func TestResolveActualLink_RejectsOpenListLocalURLBeforeDownProxyURLFallback(t *testing.T) {
+func TestResolveActualLink_FailsWhenLeafReturnsOpenListLocalURL(t *testing.T) {
 	mountPath := uniqueMountPath(t, "leaf")
-	leaf := mustCreateStubStorage(t, mountPath, stubBehavior{
+	mustCreateStubStorage(t, mountPath, stubBehavior{
 		files: []string{"/file.bin"},
 		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
 			return &model.Link{
@@ -105,22 +98,47 @@ func TestResolveActualLink_RejectsOpenListLocalURLBeforeDownProxyURLFallback(t *
 	})
 
 	ctx := context.WithValue(context.Background(), conf.ApiUrlKey, "https://example.test")
-	link, err := op.ResolveActualLink(ctx, mountPath+"/file.bin", model.LinkArgs{})
-	if err != nil {
-		t.Fatalf("expected success, got error: %v", err)
-	}
-
-	if got, want := link.URL, common.GenerateDownProxyURL(leaf.GetStorage(), mountPath+"/file.bin"); got != want {
-		t.Fatalf("expected down_proxy_url %q, got %q", want, got)
-	}
-	if got := link.Header.Get("Authorization"); got != "" {
-		t.Fatalf("expected rejected direct-link headers to be cleared, got %q", got)
+	_, err := op.ResolveActualLink(ctx, mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns OpenList-local URL")
 	}
 }
 
-func TestResolveActualLink_RejectsRelativeURLBeforeDownProxyURLFallback(t *testing.T) {
+func TestResolveActualLink_FailsWhenLeafReturnsOpenListLocalPURLOutsideAPIBasePrefix(t *testing.T) {
 	mountPath := uniqueMountPath(t, "leaf")
-	leaf := mustCreateStubStorage(t, mountPath, stubBehavior{
+	mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://example.test/p/local-file?sign=local"}, nil
+		},
+	})
+
+	ctx := context.WithValue(context.Background(), conf.ApiUrlKey, "https://example.test/openlist")
+	_, err := op.ResolveActualLink(ctx, mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns same-host /p URL outside non-root API base prefix")
+	}
+}
+
+func TestResolveActualLink_FailsWhenLeafReturnsOpenListLocalDURLOutsideAPIBasePrefix(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://example.test/d/local-file"}, nil
+		},
+	})
+
+	ctx := context.WithValue(context.Background(), conf.ApiUrlKey, "https://example.test/openlist")
+	_, err := op.ResolveActualLink(ctx, mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns same-host /d URL outside non-root API base prefix")
+	}
+}
+
+func TestResolveActualLink_FailsWhenLeafReturnsRelativeURL(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	mustCreateStubStorage(t, mountPath, stubBehavior{
 		files: []string{"/file.bin"},
 		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
 			return &model.Link{
@@ -134,20 +152,13 @@ func TestResolveActualLink_RejectsRelativeURLBeforeDownProxyURLFallback(t *testi
 		disableProxySign: true,
 	})
 
-	link, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
-	if err != nil {
-		t.Fatalf("expected success, got error: %v", err)
-	}
-
-	if got, want := link.URL, common.GenerateDownProxyURL(leaf.GetStorage(), mountPath+"/file.bin"); got != want {
-		t.Fatalf("expected down_proxy_url %q, got %q", want, got)
-	}
-	if got := link.Header.Get("Authorization"); got != "" {
-		t.Fatalf("expected rejected relative-link headers to be cleared, got %q", got)
+	_, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns relative URL")
 	}
 }
 
-func TestResolveActualLink_LeafDownProxyURLUsesResolvedLeafPath(t *testing.T) {
+func TestResolveActualLink_FailsWhenResolvedLeafWouldFallbackToDownProxyURL(t *testing.T) {
 	leafMount := uniqueMountPath(t, "leaf")
 	leaf := mustCreateStubStorage(t, leafMount, stubBehavior{
 		files: []string{"/file.bin"},
@@ -168,23 +179,131 @@ func TestResolveActualLink_LeafDownProxyURLUsesResolvedLeafPath(t *testing.T) {
 		}),
 	})
 
-	link, err := op.ResolveActualLink(context.Background(), aliasMount+"/file.bin", model.LinkArgs{})
-	if err != nil {
-		t.Fatalf("expected success, got error: %v", err)
+	_, err := op.ResolveActualLink(context.Background(), aliasMount+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when resolved leaf only has down_proxy_url fallback")
 	}
-
-	if got, want := link.URL, common.GenerateDownProxyURL(leaf.GetStorage(), leafMount+"/file.bin"); got != want {
-		t.Fatalf("expected resolved leaf down_proxy_url %q, got %q", want, got)
-	}
-	if got, unwanted := link.URL, common.GenerateDownProxyURL(leaf.GetStorage(), aliasMount+"/file.bin"); got == unwanted {
-		t.Fatalf("expected resolved leaf path, got wrapper-path down_proxy_url %q", got)
-	}
-	if got := len(link.Header); got != 0 {
-		t.Fatalf("expected empty headers on down_proxy_url fallback, got %v", link.Header)
+	if got, want := leaf.linkCalls, 1; got != want {
+		t.Fatalf("expected resolved leaf link call count %d, got %d", want, got)
 	}
 }
 
-func TestResolveActualLink_LeafDownProxyURLUsesSignedGenerationRule(t *testing.T) {
+func TestResolveActualLink_FailsWhenLeafWouldOnlyProduceSignedDownProxyURL(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/signed.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{}, nil
+		},
+		downProxyURL: "https://proxy.example.com",
+	})
+
+	_, err := op.ResolveActualLink(context.Background(), mountPath+"/signed.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when signed down_proxy_url fallback is the only available result")
+	}
+}
+
+func TestResolveActualLink_FailsWhenLeafReturnsUnsignedSynthesizedExternalDownProxyURL(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	leaf := mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{}, nil
+		},
+		downProxyURL:     "https://proxy.example.com",
+		disableProxySign: true,
+	})
+	proxyURL := common.GenerateDownProxyURL(leaf.GetStorage(), mountPath+"/file.bin")
+	if strings.Contains(proxyURL, "?sign=") {
+		t.Fatalf("expected unsigned synthesized proxy URL, got %q", proxyURL)
+	}
+	leaf.link = func(model.Obj, model.LinkArgs) (*model.Link, error) {
+		return &model.Link{URL: proxyURL}, nil
+	}
+
+	_, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns synthesized unsigned external down_proxy_url")
+	}
+}
+
+func TestResolveActualLink_FailsWhenLeafReturnsUnsignedSynthesizedExternalDownProxyURLWithFragment(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	leaf := mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{}, nil
+		},
+		downProxyURL:     "https://proxy.example.com",
+		disableProxySign: true,
+	})
+	proxyURL := common.GenerateDownProxyURL(leaf.GetStorage(), mountPath+"/file.bin") + "#x"
+	leaf.link = func(model.Obj, model.LinkArgs) (*model.Link, error) {
+		return &model.Link{URL: proxyURL}, nil
+	}
+
+	_, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns synthesized unsigned external down_proxy_url with fragment suffix")
+	}
+}
+
+func TestResolveActualLink_FailsWhenLeafReturnsUnsignedSynthesizedExternalDownProxyURLWithExtraQuery(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	leaf := mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{}, nil
+		},
+		downProxyURL:     "https://proxy.example.com",
+		disableProxySign: true,
+	})
+	proxyURL := common.GenerateDownProxyURL(leaf.GetStorage(), mountPath+"/file.bin") + "?extra=1"
+	leaf.link = func(model.Obj, model.LinkArgs) (*model.Link, error) {
+		return &model.Link{URL: proxyURL}, nil
+	}
+
+	_, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns synthesized unsigned external down_proxy_url with extra query suffix")
+	}
+}
+
+func TestResolveActualLink_FailsWhenLeafReturnsSignedSynthesizedExternalDownProxyURL(t *testing.T) {
+	leafMount := uniqueMountPath(t, "leaf")
+	leaf := mustCreateStubStorage(t, leafMount, stubBehavior{
+		files: []string{"/signed.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{}, nil
+		},
+		downProxyURL: "https://proxy.example.com",
+	})
+	proxyURL := common.GenerateDownProxyURL(leaf.GetStorage(), leafMount+"/signed.bin")
+	if !strings.Contains(proxyURL, "?sign=") {
+		t.Fatalf("expected signed synthesized proxy URL, got %q", proxyURL)
+	}
+	leaf.link = func(model.Obj, model.LinkArgs) (*model.Link, error) {
+		return &model.Link{URL: proxyURL}, nil
+	}
+
+	aliasMount := uniqueMountPath(t, "alias")
+	mustCreateStorage(t, model.Storage{
+		MountPath: aliasMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           leafMount,
+			ProtectSameName: true,
+		}),
+	})
+
+	_, err := op.ResolveActualLink(context.Background(), aliasMount+"/signed.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns signed synthesized external down_proxy_url for the resolved leaf path")
+	}
+}
+
+func TestResolveActualLink_FailsWhenLeafReturnsSigningEnabledDownProxyURLWithoutSign(t *testing.T) {
 	mountPath := uniqueMountPath(t, "leaf")
 	leaf := mustCreateStubStorage(t, mountPath, stubBehavior{
 		files: []string{"/signed.bin"},
@@ -193,21 +312,159 @@ func TestResolveActualLink_LeafDownProxyURLUsesSignedGenerationRule(t *testing.T
 		},
 		downProxyURL: "https://proxy.example.com",
 	})
-
-	link, err := op.ResolveActualLink(context.Background(), mountPath+"/signed.bin", model.LinkArgs{})
-	if err != nil {
-		t.Fatalf("expected success, got error: %v", err)
+	leaf.link = func(model.Obj, model.LinkArgs) (*model.Link, error) {
+		return &model.Link{URL: "https://proxy.example.com" + utils.EncodePath(mountPath+"/signed.bin", true)}, nil
 	}
 
-	if got, want := link.URL, common.GenerateDownProxyURL(leaf.GetStorage(), mountPath+"/signed.bin"); got != want {
-		t.Fatalf("expected signed down_proxy_url %q, got %q", want, got)
-	}
-	if !strings.Contains(link.URL, "?sign=") {
-		t.Fatalf("expected signed down_proxy_url, got %q", link.URL)
+	_, err := op.ResolveActualLink(context.Background(), mountPath+"/signed.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns signing-enabled down_proxy_url path without sign")
 	}
 }
 
-func TestResolveActualLink_LeafDownProxyURLMatchesGenerateDownProxyURLAfterTokenChange(t *testing.T) {
+func TestResolveActualLink_FailsWhenLeafReturnsSigningEnabledDownProxyURLWithInvalidSign(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	leaf := mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/signed.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{}, nil
+		},
+		downProxyURL: "https://proxy.example.com",
+	})
+	leaf.link = func(model.Obj, model.LinkArgs) (*model.Link, error) {
+		return &model.Link{URL: "https://proxy.example.com" + utils.EncodePath(mountPath+"/signed.bin", true) + "?sign=definitely-invalid"}, nil
+	}
+
+	_, err := op.ResolveActualLink(context.Background(), mountPath+"/signed.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns signing-enabled down_proxy_url path with invalid sign")
+	}
+}
+
+func TestResolveActualLink_FailsWhenLeafReturnsMalformedQueryBaseDownProxyDerivedURL(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	leaf := mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{}, nil
+		},
+		downProxyURL:     "https://proxy.example.com?foo=1",
+		disableProxySign: true,
+	})
+	leaf.link = func(model.Obj, model.LinkArgs) (*model.Link, error) {
+		return &model.Link{URL: "https://proxy.example.com?foo=1" + utils.EncodePath(mountPath+"/file.bin", true)}, nil
+	}
+
+	_, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns malformed-query down_proxy_url-derived URL")
+	}
+}
+
+func TestResolveActualLink_FailsWhenLeafReturnsMalformedFragmentBaseDownProxyDerivedURL(t *testing.T) {
+	mountPath := uniqueMountPath(t, "leaf")
+	leaf := mustCreateStubStorage(t, mountPath, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{}, nil
+		},
+		downProxyURL:     "https://proxy.example.com#frag",
+		disableProxySign: true,
+	})
+	leaf.link = func(model.Obj, model.LinkArgs) (*model.Link, error) {
+		return &model.Link{URL: "https://proxy.example.com#frag" + utils.EncodePath(mountPath+"/file.bin", true)}, nil
+	}
+
+	_, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns malformed-fragment down_proxy_url-derived URL")
+	}
+}
+
+func TestResolveActualLink_FailsWhenLeafReturnsSignedSynthesizedExternalDownProxyURLWithExtraQuery(t *testing.T) {
+	leafMount := uniqueMountPath(t, "leaf")
+	leaf := mustCreateStubStorage(t, leafMount, stubBehavior{
+		files: []string{"/signed.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{}, nil
+		},
+		downProxyURL: "https://proxy.example.com",
+	})
+	proxyURL := common.GenerateDownProxyURL(leaf.GetStorage(), leafMount+"/signed.bin") + "&extra=1"
+	leaf.link = func(model.Obj, model.LinkArgs) (*model.Link, error) {
+		return &model.Link{URL: proxyURL}, nil
+	}
+
+	aliasMount := uniqueMountPath(t, "alias")
+	mustCreateStorage(t, model.Storage{
+		MountPath: aliasMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           leafMount,
+			ProtectSameName: true,
+		}),
+	})
+
+	_, err := op.ResolveActualLink(context.Background(), aliasMount+"/signed.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns signed synthesized external down_proxy_url with extra query suffix")
+	}
+}
+
+func TestResolveActualLink_FailsWhenLeafReturnsSignedSynthesizedExternalDownProxyURLWithFragment(t *testing.T) {
+	leafMount := uniqueMountPath(t, "leaf")
+	leaf := mustCreateStubStorage(t, leafMount, stubBehavior{
+		files: []string{"/signed.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{}, nil
+		},
+		downProxyURL: "https://proxy.example.com",
+	})
+	proxyURL := common.GenerateDownProxyURL(leaf.GetStorage(), leafMount+"/signed.bin") + "#x"
+	leaf.link = func(model.Obj, model.LinkArgs) (*model.Link, error) {
+		return &model.Link{URL: proxyURL}, nil
+	}
+
+	_, err := op.ResolveActualLink(context.Background(), leafMount+"/signed.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when leaf returns signed synthesized external down_proxy_url with fragment suffix")
+	}
+}
+
+func TestResolveActualLink_FailsWhenBalanceLeafReturnsConcreteDownProxyURL(t *testing.T) {
+	leafBaseMount := uniqueMountPath(t, "leaf")
+	mustCreateStubStorage(t, leafBaseMount, stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/member-one.bin"}, nil
+		},
+		downProxyURL: "https://proxy.example.com",
+	})
+	selectedLeaf := mustCreateStubStorage(t, leafBaseMount+".balance", stubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/member-two.bin"}, nil
+		},
+		downProxyURL: "https://proxy.example.com",
+	})
+	concreteProxyURL := common.GenerateDownProxyURL(selectedLeaf.GetStorage(), leafBaseMount+".balance/file.bin")
+	if got, unwanted := concreteProxyURL, common.GenerateDownProxyURL(selectedLeaf.GetStorage(), leafBaseMount+"/file.bin"); got == unwanted {
+		t.Fatalf("test setup must return the concrete balance member proxy URL, got virtual URL %q", got)
+	}
+	selectedLeaf.link = func(model.Obj, model.LinkArgs) (*model.Link, error) {
+		return &model.Link{URL: concreteProxyURL}, nil
+	}
+
+	_, err := op.ResolveActualLink(context.Background(), leafBaseMount+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when balance leaf returns synthesized external down_proxy_url for the concrete member path")
+	}
+	if got, want := selectedLeaf.linkCalls, 1; got != want {
+		t.Fatalf("expected chosen balance leaf link call count %d, got %d", want, got)
+	}
+}
+
+func TestResolveActualLink_FailsWhenTokenRefreshWouldOnlyAffectDownProxyURLFallback(t *testing.T) {
 	tokenSetting, tokenExisted := mustGetOrCreateSettingItem(t, conf.Token, "token-before-link-api-test")
 	expireSetting, expireExisted := mustGetOrCreateSettingItem(t, conf.LinkExpiration, "0")
 	t.Cleanup(func() {
@@ -230,7 +487,7 @@ func TestResolveActualLink_LeafDownProxyURLMatchesGenerateDownProxyURLAfterToken
 	mustSaveSettingItem(t, zeroExpiration)
 
 	mountPath := uniqueMountPath(t, "leaf")
-	leaf := mustCreateStubStorage(t, mountPath, stubBehavior{
+	mustCreateStubStorage(t, mountPath, stubBehavior{
 		files: []string{"/file.bin"},
 		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
 			return &model.Link{}, nil
@@ -239,27 +496,18 @@ func TestResolveActualLink_LeafDownProxyURLMatchesGenerateDownProxyURLAfterToken
 	})
 
 	initialToken := mustResetTokenThroughHandler(t)
-	initialLink, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
-	if err != nil {
-		t.Fatalf("expected initial success, got error: %v", err)
-	}
-	if got, want := initialLink.URL, common.GenerateDownProxyURL(leaf.GetStorage(), mountPath+"/file.bin"); got != want {
-		t.Fatalf("expected initial live down_proxy_url %q, got %q", want, got)
+	_, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error when token refresh would only affect down_proxy_url fallback")
 	}
 
 	updatedToken := tokenSetting
 	updatedToken.Value = initialToken + "-via-save-settings"
 	mustSaveSettingsThroughHandler(t, updatedToken)
 
-	linkAfterSaveSettings, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
-	if err != nil {
-		t.Fatalf("expected success after SaveSettings token change, got error: %v", err)
-	}
-	if got, want := linkAfterSaveSettings.URL, common.GenerateDownProxyURL(leaf.GetStorage(), mountPath+"/file.bin"); got != want {
-		t.Fatalf("expected live GenerateDownProxyURL parity after SaveSettings token change %q, got %q", want, got)
-	}
-	if got, want := linkAfterSaveSettings.URL, initialLink.URL; got != want {
-		t.Fatalf("expected generic SaveSettings token change to leave signer lifecycle unchanged, want %q got %q", want, got)
+	_, err = op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error after SaveSettings when only down_proxy_url fallback would change")
 	}
 
 	resetToken := mustResetTokenThroughHandler(t)
@@ -267,15 +515,9 @@ func TestResolveActualLink_LeafDownProxyURLMatchesGenerateDownProxyURLAfterToken
 		t.Fatalf("expected ResetToken to issue a new token, got %q", resetToken)
 	}
 
-	linkAfterReset, err := op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
-	if err != nil {
-		t.Fatalf("expected success after ResetToken, got error: %v", err)
-	}
-	if got, want := linkAfterReset.URL, common.GenerateDownProxyURL(leaf.GetStorage(), mountPath+"/file.bin"); got != want {
-		t.Fatalf("expected live GenerateDownProxyURL parity after ResetToken %q, got %q", want, got)
-	}
-	if got, previous := linkAfterReset.URL, initialLink.URL; got == previous {
-		t.Fatalf("expected ResetToken to refresh signer lifecycle, still got %q", got)
+	_, err = op.ResolveActualLink(context.Background(), mountPath+"/file.bin", model.LinkArgs{})
+	if err == nil {
+		t.Fatal("expected error after ResetToken when only down_proxy_url fallback would change")
 	}
 }
 
@@ -314,6 +556,47 @@ func TestResolveActualLink_AliasStopsAtFirstResolvableTargetPath(t *testing.T) {
 	}
 	if got := secondLeaf.linkCalls; got != 0 {
 		t.Fatalf("expected later alias targets to be skipped after the first resolvable path, got %d link calls", got)
+	}
+}
+
+func TestResolveActualLink_AliasFirstExistingTargetWinsEvenWhenOtherTargetHasDifferentLeaf(t *testing.T) {
+	firstMount := uniqueMountPath(t, "origin-one")
+	firstLeaf := mustCreateStubStorage(t, firstMount, stubBehavior{
+		files: []string{"/file-A.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/origin-one.bin"}, nil
+		},
+	})
+	secondMount := uniqueMountPath(t, "origin-two")
+	secondLeaf := mustCreateStubStorage(t, secondMount, stubBehavior{
+		files: []string{"/file-A.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/origin-two.bin"}, nil
+		},
+	})
+
+	aliasMount := uniqueMountPath(t, "alias-first-existing")
+	mustCreateStorage(t, model.Storage{
+		MountPath: aliasMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           "docs:" + firstMount + "\ndocs:" + secondMount,
+			ProtectSameName: true,
+		}),
+	})
+
+	link, err := op.ResolveActualLink(context.Background(), aliasMount+"/file-A.bin", model.LinkArgs{})
+	if err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if got, want := link.URL, "https://download.example.com/origin-one.bin"; got != want {
+		t.Fatalf("expected first existing origin upstream %q, got %q", want, got)
+	}
+	if got, want := firstLeaf.linkCalls, 1; got != want {
+		t.Fatalf("expected first leaf link call count %d, got %d", want, got)
+	}
+	if got := secondLeaf.linkCalls; got != 0 {
+		t.Fatalf("expected later alias target to stay unselected after first existing target, got %d link calls", got)
 	}
 }
 

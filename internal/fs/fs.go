@@ -160,7 +160,11 @@ type GetStoragesArgs struct {
 }
 
 func GetStorage(path string, args *GetStoragesArgs) (driver.Driver, error) {
-	storageDriver, _, err := op.GetStorageAndActualPath(path)
+	return GetStorageWithContext(context.Background(), path, args)
+}
+
+func GetStorageWithContext(ctx context.Context, path string, args *GetStoragesArgs) (driver.Driver, error) {
+	storageDriver, _, err := op.GetStorageAndActualPathByContext(ctx, path)
 	if err != nil {
 		return nil, err
 	}

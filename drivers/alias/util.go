@@ -106,7 +106,7 @@ func (d *Alias) ResolveLinkAPIRawPath(ctx context.Context, rawPath string) (stri
 }
 
 func (d *Alias) link(ctx context.Context, reqPath string, args model.LinkArgs) (*model.Link, model.Obj, error) {
-	storage, reqActualPath, err := op.GetStorageAndActualPath(reqPath)
+	storage, reqActualPath, err := op.GetStorageAndActualPathByContext(ctx, reqPath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -163,7 +163,7 @@ func (d *Alias) getReqPath(ctx context.Context, obj model.Obj, isParent bool) ([
 
 func (d *Alias) getArchiveMeta(ctx context.Context, dst, sub string, args model.ArchiveArgs) (model.ArchiveMeta, error) {
 	reqPath := stdpath.Join(dst, sub)
-	storage, reqActualPath, err := op.GetStorageAndActualPath(reqPath)
+	storage, reqActualPath, err := op.GetStorageAndActualPathByContext(ctx, reqPath)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +178,7 @@ func (d *Alias) getArchiveMeta(ctx context.Context, dst, sub string, args model.
 
 func (d *Alias) listArchive(ctx context.Context, dst, sub string, args model.ArchiveInnerArgs) ([]model.Obj, error) {
 	reqPath := stdpath.Join(dst, sub)
-	storage, reqActualPath, err := op.GetStorageAndActualPath(reqPath)
+	storage, reqActualPath, err := op.GetStorageAndActualPathByContext(ctx, reqPath)
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +192,7 @@ func (d *Alias) listArchive(ctx context.Context, dst, sub string, args model.Arc
 }
 
 func (d *Alias) extract(ctx context.Context, reqPath string, args model.ArchiveInnerArgs) (*model.Link, error) {
-	storage, reqActualPath, err := op.GetStorageAndActualPath(reqPath)
+	storage, reqActualPath, err := op.GetStorageAndActualPathByContext(ctx, reqPath)
 	if err != nil {
 		return nil, err
 	}
