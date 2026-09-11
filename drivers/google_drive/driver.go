@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -19,18 +20,23 @@ import (
 type GoogleDrive struct {
 	model.Storage
 	Addition
-	AccessToken            string
-	ServiceAccountFile     int
-	ServiceAccountFileList []string
-	modeCfg                downloadModeConfig
-	accounts               []accountRuntime
-	accountPool            *accountPool
-	accountStore           accountStore
-	accountStateMu         sync.RWMutex
-	accountRefreshSlots    []*sync.Mutex
-	accountRefreshMu       sync.Mutex
-	accountRefreshWG       sync.WaitGroup
-	accountRefreshClosed   bool
+	AccessToken                       string
+	ServiceAccountFile                int
+	ServiceAccountFileList            []string
+	modeCfg                           downloadModeConfig
+	accounts                          []accountRuntime
+	accountPool                       *accountPool
+	accountHealth                     *accountHealthRuntime
+	accountStore                      accountStore
+	accountStateMu                    sync.RWMutex
+	accountRefreshSlots               []*sync.Mutex
+	accountRefreshMu                  sync.Mutex
+	accountRefreshWG                  sync.WaitGroup
+	accountRefreshClosed              bool
+	singleRefreshMu                   sync.Mutex
+	singleCredentialGeneration        uint64
+	singleInvalidCredentialGeneration uint64
+	singleTokenExpiry                 string
 }
 
 func (d *GoogleDrive) Config() driver.Config {
@@ -56,7 +62,10 @@ func (d *GoogleDrive) Init(ctx context.Context) error {
 		if strings.TrimSpace(d.RefreshToken) == "" {
 			return fmt.Errorf("google_drive: refresh_token is required in single-account mode")
 		}
-		return d.refreshToken()
+		return d.refreshTokenWithContext(ctx)
+	}
+	if db.GetDb() == nil {
+		return fmt.Errorf("google_drive: database is not initialized for accounts_json mode")
 	}
 
 	return d.initAccountsJSONMode(ctx)
@@ -80,7 +89,7 @@ func (d *GoogleDrive) Drop(ctx context.Context) error {
 }
 
 func (d *GoogleDrive) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-	files, err := d.getFiles(dir.GetID())
+	files, err := d.getFilesWithContext(ctx, dir.GetID())
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +108,7 @@ func (d *GoogleDrive) Link(ctx context.Context, file model.Obj, args model.LinkA
 		}
 		authorizationToken = winningToken
 	} else {
-		_, err := d.request(url, http.MethodGet, nil, nil)
+		_, err := d.requestWithContext(ctx, url, http.MethodGet, nil, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -120,7 +129,7 @@ func (d *GoogleDrive) MakeDir(ctx context.Context, parentDir model.Obj, dirName 
 		"parents":  []string{parentDir.GetID()},
 		"mimeType": "application/vnd.google-apps.folder",
 	}
-	_, err := d.request("https://www.googleapis.com/drive/v3/files", http.MethodPost, func(req *resty.Request) {
+	_, err := d.requestWithContext(ctx, "https://www.googleapis.com/drive/v3/files", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, nil)
 	return err
@@ -132,7 +141,7 @@ func (d *GoogleDrive) Move(ctx context.Context, srcObj, dstDir model.Obj) error 
 		"removeParents": "root",
 	}
 	url := "https://www.googleapis.com/drive/v3/files/" + srcObj.GetID()
-	_, err := d.request(url, http.MethodPatch, func(req *resty.Request) {
+	_, err := d.requestWithContext(ctx, url, http.MethodPatch, func(req *resty.Request) {
 		req.SetQueryParams(query)
 	}, nil)
 	return err
@@ -143,7 +152,7 @@ func (d *GoogleDrive) Rename(ctx context.Context, srcObj model.Obj, newName stri
 		"name": newName,
 	}
 	url := "https://www.googleapis.com/drive/v3/files/" + srcObj.GetID()
-	_, err := d.request(url, http.MethodPatch, func(req *resty.Request) {
+	_, err := d.requestWithContext(ctx, url, http.MethodPatch, func(req *resty.Request) {
 		req.SetBody(data)
 	}, nil)
 	return err
@@ -155,7 +164,7 @@ func (d *GoogleDrive) Copy(ctx context.Context, srcObj, dstDir model.Obj) error 
 
 func (d *GoogleDrive) Remove(ctx context.Context, obj model.Obj) error {
 	url := "https://www.googleapis.com/drive/v3/files/" + obj.GetID()
-	_, err := d.request(url, http.MethodDelete, nil, nil)
+	_, err := d.requestWithContext(ctx, url, http.MethodDelete, nil, nil)
 	return err
 }
 
@@ -209,7 +218,7 @@ func (d *GoogleDrive) Put(ctx context.Context, dstDir model.Obj, stream model.Fi
 				}
 				return d.Put(ctx, dstDir, stream, up)
 			}
-			err = d.refreshToken()
+			err = d.repairSingletonCredentialWithContext(ctx)
 			if err != nil {
 				return err
 			}

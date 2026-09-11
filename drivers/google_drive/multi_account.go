@@ -3,9 +3,11 @@ package google_drive
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"golang.org/x/oauth2"
 )
 
@@ -41,30 +44,49 @@ type accountConfig struct {
 }
 
 type accountRuntime struct {
-	Index        int
-	Name         string
-	ClientID     string
-	ClientSecret string
-	TokenJSON    string
-	Token        oauthTokenView
+	Index                       int
+	Name                        string
+	ClientID                    string
+	ClientSecret                string
+	TokenJSON                   string
+	Token                       oauthTokenView
+	CredentialGeneration        uint64
+	InvalidCredentialGeneration uint64
 }
 
 type accountPool struct {
-	mu         sync.Mutex
-	policy     string
-	rrCursor   uint64
-	accounts   []accountRuntime
-	randMu     sync.Mutex
-	randSource *rand.Rand
+	mu             sync.Mutex
+	policy         string
+	rrCursor       uint64
+	downloadCursor uint64
+	accounts       []accountRuntime
+	randMu         sync.Mutex
+	randSource     *rand.Rand
+}
+
+func deduplicateAccountConfigs(accounts []accountConfig) []accountConfig {
+	active := make([]accountConfig, 0, len(accounts))
+	seen := make(map[string]struct{}, len(accounts))
+	for _, account := range accounts {
+		account.Name = strings.TrimSpace(account.Name)
+		if _, ok := seen[account.Name]; ok {
+			continue
+		}
+		seen[account.Name] = struct{}{}
+		active = append(active, account)
+	}
+	return active
 }
 
 type accountSnapshot struct {
-	Index        int
-	Name         string
-	ClientID     string
-	ClientSecret string
-	TokenJSON    string
-	Token        oauthTokenView
+	Index                       int
+	Name                        string
+	ClientID                    string
+	ClientSecret                string
+	TokenJSON                   string
+	Token                       oauthTokenView
+	CredentialGeneration        uint64
+	InvalidCredentialGeneration uint64
 }
 
 type accountStore interface {
@@ -121,25 +143,25 @@ func validateDownloadModeConfig(add Addition) (downloadModeConfig, error) {
 	}, nil
 }
 
-func parseAccountsJSON(path string, add Addition) ([]accountConfig, error) {
+func parseAccountsJSON(path string, add Addition) ([]accountConfig, []byte, error) {
 	if !filepath.IsAbs(path) {
-		return nil, fmt.Errorf("google_drive: accounts_json must be an absolute path")
+		return nil, nil, fmt.Errorf("google_drive: accounts_json must be an absolute path")
 	}
 
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("google_drive: read accounts_json: %w", err)
+		return nil, nil, fmt.Errorf("google_drive: read accounts_json: %w", err)
 	}
 
 	trimmed := strings.TrimSpace(string(content))
 	if trimmed == "" {
-		return nil, fmt.Errorf("google_drive: accounts_json must not be empty")
+		return nil, nil, fmt.Errorf("google_drive: accounts_json must not be empty")
 	}
 
 	var rawEntries []rawAccountConfig
 	if strings.HasPrefix(trimmed, "[") {
 		if err := json.Unmarshal([]byte(trimmed), &rawEntries); err != nil {
-			return nil, fmt.Errorf("google_drive: parse accounts_json: %w", err)
+			return nil, nil, fmt.Errorf("google_drive: parse accounts_json: %w", err)
 		}
 	} else {
 		lines := strings.Split(trimmed, "\n")
@@ -151,26 +173,26 @@ func parseAccountsJSON(path string, add Addition) ([]accountConfig, error) {
 			}
 			var entry rawAccountConfig
 			if err := json.Unmarshal([]byte(line), &entry); err != nil {
-				return nil, fmt.Errorf("google_drive: parse accounts_json: %w", err)
+				return nil, nil, fmt.Errorf("google_drive: parse accounts_json: %w", err)
 			}
 			rawEntries = append(rawEntries, entry)
 		}
 	}
 
 	if len(rawEntries) == 0 {
-		return nil, fmt.Errorf("google_drive: accounts_json must not be empty")
+		return nil, nil, fmt.Errorf("google_drive: accounts_json must not be empty")
 	}
 
 	accounts := make([]accountConfig, 0, len(rawEntries))
 	for index, entry := range rawEntries {
 		tokenJSON, err := normalizeAccountTokenJSON(entry.Token)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		name := strings.TrimSpace(entry.Name)
 		if name == "" {
-			name = fmt.Sprintf("account-%d", index)
+			return nil, nil, fmt.Errorf("google_drive: account name must be nonempty at entry %d", index)
 		}
 
 		clientID := strings.TrimSpace(entry.ClientID)
@@ -194,7 +216,11 @@ func parseAccountsJSON(path string, add Addition) ([]accountConfig, error) {
 		})
 	}
 
-	return accounts, nil
+	snapshot, err := semanticAccountsSnapshot(content)
+	if err != nil {
+		return nil, nil, fmt.Errorf("google_drive: snapshot accounts_json source: %w", err)
+	}
+	return accounts, snapshot, nil
 }
 
 func normalizeAccountTokenJSON(raw json.RawMessage) (string, error) {
@@ -234,12 +260,13 @@ func initAccountRuntime(cfg accountConfig) (accountRuntime, error) {
 	}
 
 	return accountRuntime{
-		Index:        cfg.Index,
-		Name:         cfg.Name,
-		ClientID:     cfg.ClientID,
-		ClientSecret: cfg.ClientSecret,
-		TokenJSON:    cfg.TokenJSON,
-		Token:        token,
+		Index:                cfg.Index,
+		Name:                 cfg.Name,
+		ClientID:             cfg.ClientID,
+		ClientSecret:         cfg.ClientSecret,
+		TokenJSON:            cfg.TokenJSON,
+		Token:                token,
+		CredentialGeneration: 1,
 	}, nil
 }
 
@@ -254,6 +281,20 @@ func newAccountPool(policy string, accounts []accountRuntime) *accountPool {
 }
 
 func (p *accountPool) nextAttemptOrder(attemptBudget int) []int {
+	if p == nil {
+		return nil
+	}
+	return p.nextAttemptOrderFromCursor(attemptBudget, &p.rrCursor)
+}
+
+func (p *accountPool) nextDownloadAttemptOrder(attemptBudget int) []int {
+	if p == nil {
+		return nil
+	}
+	return p.nextAttemptOrderFromCursor(attemptBudget, &p.downloadCursor)
+}
+
+func (p *accountPool) nextAttemptOrderFromCursor(attemptBudget int, cursor *uint64) []int {
 	if p == nil || len(p.accounts) == 0 || attemptBudget <= 0 {
 		return nil
 	}
@@ -274,7 +315,7 @@ func (p *accountPool) nextAttemptOrder(attemptBudget int) []int {
 		return indexes[:attemptBudget]
 	}
 
-	start := int(atomic.AddUint64(&p.rrCursor, 1)-1) % len(p.accounts)
+	start := int(atomic.AddUint64(cursor, 1)-1) % len(p.accounts)
 	order := make([]int, 0, attemptBudget)
 	for i := 0; i < attemptBudget; i++ {
 		order = append(order, (start+i)%len(p.accounts))
@@ -298,9 +339,27 @@ func (d *GoogleDrive) currentAccessToken() string {
 	return d.AccessToken
 }
 
-func (d *GoogleDrive) setAccessToken(accessToken string) {
+func (d *GoogleDrive) installSingleCredential(accessToken, refreshToken, expiry string) {
+	if strings.TrimSpace(accessToken) == "" {
+		return
+	}
+	if expiry == "" {
+		expiry = refreshExpiry(0)
+	}
 	d.accountStateMu.Lock()
+	generation := d.singleCredentialGeneration
+	if generation == 0 {
+		generation = 1
+	} else {
+		generation++
+	}
+	d.singleCredentialGeneration = generation
+	d.singleInvalidCredentialGeneration = 0
+	d.singleTokenExpiry = expiry
 	d.AccessToken = accessToken
+	if strings.TrimSpace(refreshToken) != "" {
+		d.RefreshToken = refreshToken
+	}
 	d.accountStateMu.Unlock()
 }
 
@@ -321,23 +380,28 @@ func (d *GoogleDrive) accountSnapshot(index int) (accountSnapshot, error) {
 	}
 	account := d.accounts[index]
 	return accountSnapshot{
-		Index:        account.Index,
-		Name:         account.Name,
-		ClientID:     account.ClientID,
-		ClientSecret: account.ClientSecret,
-		TokenJSON:    account.TokenJSON,
-		Token:        account.Token,
+		Index:                       account.Index,
+		Name:                        account.Name,
+		ClientID:                    account.ClientID,
+		ClientSecret:                account.ClientSecret,
+		TokenJSON:                   account.TokenJSON,
+		Token:                       account.Token,
+		CredentialGeneration:        max(account.CredentialGeneration, 1),
+		InvalidCredentialGeneration: account.InvalidCredentialGeneration,
 	}, nil
 }
 
 func (d *GoogleDrive) initAccountsJSONMode(ctx context.Context) error {
-	parsed, err := parseAccountsJSON(d.modeCfg.AccountsPath, d.Addition)
+	accountsPath := filepath.Clean(d.modeCfg.AccountsPath)
+	d.modeCfg.AccountsPath = accountsPath
+	parsed, sourceSnapshot, err := parseAccountsJSON(accountsPath, d.Addition)
 	if err != nil {
 		return err
 	}
 
-	runtimes := make([]accountRuntime, 0, len(parsed))
-	for _, cfg := range parsed {
+	active := deduplicateAccountConfigs(parsed)
+	runtimes := make([]accountRuntime, 0, len(active))
+	for _, cfg := range active {
 		rt, err := initAccountRuntime(cfg)
 		if err != nil {
 			return err
@@ -352,12 +416,21 @@ func (d *GoogleDrive) initAccountsJSONMode(ctx context.Context) error {
 		d.accountRefreshSlots[i] = &sync.Mutex{}
 	}
 	d.accountStateMu.Unlock()
-	d.accountPool = newAccountPool(d.modeCfg.SelectionPolicy, d.accounts)
-	store, err := newAccountStore(parsed, d.modeCfg.AccountsPath)
+	store, err := attachAccountStore(ctx, parsed, accountsPath, sourceSnapshot)
 	if err != nil {
 		return err
 	}
 	d.accountStore = store
+	if db.GetDb() != nil {
+		d.accountHealth = sharedAccountHealth
+		for _, account := range d.accounts {
+			if _, err := d.accountHealth.getWithContext(ctx, account.Name); err != nil {
+				_ = d.accountStore.shutdown(context.Background())
+				return err
+			}
+		}
+	}
+	d.accountPool = newAccountPool(d.modeCfg.SelectionPolicy, d.accounts)
 	return d.syncPrimaryAccessToken()
 }
 
@@ -371,13 +444,18 @@ func (d *GoogleDrive) updateAccountToken(index int, token oauthTokenView) error 
 		d.accountStateMu.Unlock()
 		return fmt.Errorf("google_drive: invalid account index %d", index)
 	}
+	persistIndex := d.accounts[index].Index
 	d.accounts[index].Token = token
 	d.accounts[index].TokenJSON = string(tokenJSON)
+	d.accounts[index].CredentialGeneration = max(d.accounts[index].CredentialGeneration, 1) + 1
+	d.accounts[index].InvalidCredentialGeneration = 0
 	if index == 0 {
 		d.AccessToken = token.AccessToken
 	}
 	d.accountStateMu.Unlock()
-	d.accountStore.setToken(index, string(tokenJSON))
+	if d.accountStore != nil {
+		d.accountStore.setToken(persistIndex, string(tokenJSON))
+	}
 	return nil
 }
 
@@ -438,6 +516,14 @@ func (d *GoogleDrive) waitForAccountRefreshes(ctx context.Context) error {
 }
 
 func (d *GoogleDrive) refreshAccount(ctx context.Context, index int) error {
+	return d.refreshAccountLocked(ctx, index, false)
+}
+
+func (d *GoogleDrive) refreshAccountIfNeeded(ctx context.Context, index int) error {
+	return d.refreshAccountLocked(ctx, index, true)
+}
+
+func (d *GoogleDrive) refreshAccountLocked(ctx context.Context, index int, onlyIfNeeded bool) error {
 	if err := d.beginAccountRefresh(); err != nil {
 		return err
 	}
@@ -452,10 +538,14 @@ func (d *GoogleDrive) refreshAccount(ctx context.Context, index int) error {
 	if err != nil {
 		return err
 	}
+	if onlyIfNeeded && strings.TrimSpace(account.Token.AccessToken) != "" && account.InvalidCredentialGeneration != account.CredentialGeneration && !tokenExpiresSoon(account.Token.Expiry, time.Now()) {
+		return nil
+	}
 	if d.UseOnlineAPI && len(d.APIAddress) > 0 {
 		var resp struct {
 			RefreshToken string `json:"refresh_token"`
 			AccessToken  string `json:"access_token"`
+			ExpiresIn    int    `json:"expires_in"`
 			ErrorMessage string `json:"text"`
 		}
 		req := base.RestyClient.R().
@@ -482,14 +572,18 @@ func (d *GoogleDrive) refreshAccount(ctx context.Context, index int) error {
 		return d.updateAccountToken(index, oauthTokenView{
 			AccessToken:  resp.AccessToken,
 			RefreshToken: resp.RefreshToken,
-			Expiry:       account.Token.Expiry,
+			Expiry:       refreshExpiry(resp.ExpiresIn),
 		})
 	}
 	if account.ClientID == "" || account.ClientSecret == "" {
 		return fmt.Errorf("empty ClientID or ClientSecret")
 	}
 	url := "https://www.googleapis.com/oauth2/v4/token"
-	var resp base.TokenResp
+	var resp struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
 	var e TokenError
 	req := base.RestyClient.R().SetResult(&resp).SetError(&e).SetFormData(map[string]string{
 		"client_id":     account.ClientID,
@@ -514,7 +608,15 @@ func (d *GoogleDrive) refreshAccount(ctx context.Context, index int) error {
 	if strings.TrimSpace(resp.RefreshToken) != "" {
 		account.Token.RefreshToken = resp.RefreshToken
 	}
+	account.Token.Expiry = refreshExpiry(resp.ExpiresIn)
 	return d.updateAccountToken(index, account.Token)
+}
+
+func refreshExpiry(expiresIn int) string {
+	if expiresIn <= 0 {
+		expiresIn = int(googleDownloadDefaultLifetime / time.Second)
+	}
+	return time.Now().Add(time.Duration(expiresIn) * time.Second).Format(time.RFC3339)
 }
 
 func (d *GoogleDrive) refreshPrimaryAccount(ctx context.Context) error {
@@ -614,25 +716,72 @@ func isRetryableDownloadStatus(statusCode int, body []byte) bool {
 	return false
 }
 
+type downloadAccountSelection struct {
+	account accountSnapshot
+	health  AccountHealthLease
+}
+
+func (d *GoogleDrive) acquireDownloadAccount(ctx context.Context, fileID string, index int) (downloadAccountSelection, error) {
+	account, err := d.accountSnapshot(index)
+	if err != nil {
+		return downloadAccountSelection{}, err
+	}
+	selection := downloadAccountSelection{account: account}
+	if d.accountHealth != nil {
+		selection.health, err = d.accountHealth.acquire(ctx, account.Name, fileID)
+		if err != nil {
+			return downloadAccountSelection{}, err
+		}
+	}
+	return selection, nil
+}
+
+func googleDriveFileIDFromRequestURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err == nil {
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		for i := 0; i+1 < len(parts); i++ {
+			if parts[i] == "files" && parts[i+1] != "" {
+				return parts[i+1]
+			}
+		}
+	}
+	return strings.TrimSpace(rawURL)
+}
+
 func (d *GoogleDrive) requestDownloadWithRotation(ctx context.Context, url string, method string, callback base.ReqCallback, resp interface{}) (winningToken string, body []byte, err error) {
 	d.accountStateMu.RLock()
+	accountCount := len(d.accounts)
 	hasAccounts := len(d.accounts) > 0
 	d.accountStateMu.RUnlock()
 	if !hasAccounts {
 		return "", nil, fmt.Errorf("google_drive: accounts_json must include at least one account")
 	}
 	attemptBudget := 1 + d.modeCfg.DownloadRetryMax
-	order := d.accountPool.nextAttemptOrder(attemptBudget)
+	order := d.accountPool.nextDownloadAttemptOrder(accountCount)
 	if len(order) == 0 {
 		return "", nil, fmt.Errorf("google_drive: accounts_json must include at least one account")
 	}
 
 	failures := make([]string, 0, len(order))
+	var lastUnavailable error
+	attempts := 0
+	fileID := googleDriveFileIDFromRequestURL(url)
 	for _, index := range order {
-		account, err := d.accountSnapshot(index)
+		if attempts >= attemptBudget {
+			break
+		}
+		selection, err := d.acquireDownloadAccount(ctx, fileID, index)
 		if err != nil {
+			var unavailable *AccountHealthUnavailableError
+			if errors.As(err, &unavailable) {
+				lastUnavailable = err
+				continue
+			}
 			return "", nil, err
 		}
+		attempts++
+		account := selection.account
 		body, statusCode, reqErr := executeRequestWithToken(ctx, account.Token.AccessToken, url, method, callback, resp)
 		if reqErr != nil {
 			return "", nil, reqErr
@@ -664,6 +813,9 @@ func (d *GoogleDrive) requestDownloadWithRotation(ctx context.Context, url strin
 			return "", nil, fmt.Errorf("google_drive: non-retryable download error for %s", failure)
 		}
 		failures = append(failures, failure)
+	}
+	if attempts == 0 && lastUnavailable != nil {
+		return "", nil, lastUnavailable
 	}
 
 	return "", nil, fmt.Errorf("google_drive: download rotation exhausted: %s", strings.Join(failures, "; "))

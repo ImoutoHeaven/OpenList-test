@@ -34,11 +34,32 @@ type Link struct {
 	Expiration *time.Duration // local cache expire Duration
 
 	//for accelerating request, use multi-thread downloading
-	Concurrency   int   `json:"concurrency"`
-	PartSize      int   `json:"part_size"`
-	ContentLength int64 `json:"-"` // 转码视频、缩略图
+	Concurrency   int                    `json:"concurrency"`
+	PartSize      int                    `json:"part_size"`
+	ContentLength int64                  `json:"-"` // 转码视频、缩略图
+	Size          int64                  `json:"size"`
+	Download      *DownloadAuthorization `json:"download"`
 
 	utils.SyncClosers `json:"-"`
+}
+
+// DownloadAuthorization is the signed server-side authorization accompanying
+// a link returned by the administrator download API.
+type DownloadAuthorization struct {
+	Provider      string `json:"provider"`
+	Ticket        string `json:"ticket"`
+	ExpiresAt     int64  `json:"expires_at"`
+	ReportSuccess bool   `json:"report_success"`
+}
+
+// DownloadFeedback is the terminal content result sent with a replacement
+// acquisition or a report-only link request.
+type DownloadFeedback struct {
+	Ticket     string `json:"ticket"`
+	EventID    string `json:"event_id"`
+	Outcome    string `json:"outcome"`
+	StatusCode int    `json:"status_code"`
+	Reason     string `json:"reason"`
 }
 
 type OtherArgs struct {

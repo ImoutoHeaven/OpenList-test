@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -20,6 +21,21 @@ func CreateStorage(storage *model.Storage) error {
 // UpdateStorage just update storage in database
 func UpdateStorage(storage *model.Storage) error {
 	return errors.WithStack(db.Save(storage).Error)
+}
+
+// UpdateStorageContext updates a storage using the caller's context.
+func UpdateStorageContext(ctx context.Context, storage *model.Storage) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if db == nil {
+		return errors.New("database is not initialized")
+	}
+	err := db.WithContext(ctx).Save(storage).Error
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
+	}
+	return errors.WithStack(err)
 }
 
 // DeleteStorageById just delete storage from database by id

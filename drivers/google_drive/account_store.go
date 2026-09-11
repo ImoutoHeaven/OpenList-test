@@ -1,11 +1,14 @@
 package google_drive
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +20,8 @@ type accountStoreFlushRequest struct {
 	targetRev uint64
 	resultCh  chan error
 }
+
+type accountStorePersistFn func(string, string, []byte) ([]byte, error)
 
 type fileAccountStore struct {
 	mu           sync.RWMutex
@@ -32,10 +37,36 @@ type fileAccountStore struct {
 	stopCh   chan struct{}
 	doneCh   chan struct{}
 
-	persistFn func(string, string) error
-	backoffFn func(int) time.Duration
-	stopOnce  sync.Once
+	persistSnapshotFn accountStorePersistFn
+	backoffFn         func(int) time.Duration
+	persistedSnapshot []byte
+	stopOnce          sync.Once
 }
+
+type sharedFileAccountStore struct {
+	core    *fileAccountStore
+	refs    int
+	closing bool
+	done    chan struct{}
+}
+
+type fileAccountStoreHandle struct {
+	key   string
+	entry *sharedFileAccountStore
+
+	shutdownOnce sync.Once
+	shutdownDone chan struct{}
+	shutdownErr  error
+}
+
+var sharedFileAccountStores = struct {
+	sync.Mutex
+	entries map[string]*sharedFileAccountStore
+}{
+	entries: make(map[string]*sharedFileAccountStore),
+}
+
+var errAccountStoreIdentityMismatch = errors.New("google_drive: accounts_json identity changed while persisting")
 
 type persistedAccountFileEntry struct {
 	Name         string          `json:"name,omitempty"`
@@ -53,19 +84,124 @@ const (
 
 var persistedCredentialFields = []string{"token", "client_id", "client_secret"}
 
-func newAccountStore(initial []accountConfig, path string) (*fileAccountStore, error) {
-	return newAccountStoreWithHooks(initial, path, persistAccountsJSONFile, defaultAccountStoreBackoff)
+func newAccountStore(initial []accountConfig, path string, sourceSnapshot []byte) (*fileAccountStore, error) {
+	return newAccountStoreWithHooks(initial, path, nil, defaultAccountStoreBackoff, sourceSnapshot)
 }
 
-func newAccountStoreWithHooks(initial []accountConfig, path string, persistFn func(string, string) error, backoffFn func(int) time.Duration) (*fileAccountStore, error) {
+func attachAccountStore(ctx context.Context, initial []accountConfig, path string, sourceSnapshot []byte) (accountStore, error) {
+	return attachAccountStoreWithHooks(ctx, initial, path, nil, defaultAccountStoreBackoff, sourceSnapshot)
+}
+
+func attachAccountStoreWithHooks(ctx context.Context, initial []accountConfig, path string, persistFn accountStorePersistFn, backoffFn func(int) time.Duration, sourceSnapshot []byte) (accountStore, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	path = filepath.Clean(path)
+	if err := validateAccountStorePath(path); err != nil {
+		return nil, err
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		sharedFileAccountStores.Lock()
+		entry := sharedFileAccountStores.entries[path]
+		if entry == nil {
+			core, err := newAccountStoreWithHooks(initial, path, persistFn, backoffFn, sourceSnapshot)
+			if err != nil {
+				sharedFileAccountStores.Unlock()
+				return nil, err
+			}
+			if err := ctx.Err(); err != nil {
+				sharedFileAccountStores.Unlock()
+				_ = core.shutdown(context.Background())
+				return nil, err
+			}
+			entry = &sharedFileAccountStore{core: core, refs: 1, done: make(chan struct{})}
+			sharedFileAccountStores.entries[path] = entry
+			sharedFileAccountStores.Unlock()
+			handle := newFileAccountStoreHandle(path, entry)
+			if err := ctx.Err(); err != nil {
+				_ = handle.shutdown(context.Background())
+				return nil, err
+			}
+			return handle, nil
+		}
+		if entry.closing {
+			done := entry.done
+			sharedFileAccountStores.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			sharedFileAccountStores.Unlock()
+			return nil, err
+		}
+		currentSnapshot, err := readAccountSemanticSnapshot(path)
+		if err != nil {
+			sharedFileAccountStores.Unlock()
+			return nil, fmt.Errorf("%w: read current account snapshot: %v", errAccountStoreIdentityMismatch, err)
+		}
+		if !bytes.Equal(currentSnapshot, sourceSnapshot) {
+			sharedFileAccountStores.Unlock()
+			return nil, fmt.Errorf("%w: account source changed during attachment", errAccountStoreIdentityMismatch)
+		}
+		if err := entry.core.validateAttachment(initial, sourceSnapshot); err != nil {
+			sharedFileAccountStores.Unlock()
+			return nil, err
+		}
+		entry.refs++
+		sharedFileAccountStores.Unlock()
+		handle := newFileAccountStoreHandle(path, entry)
+		if err := ctx.Err(); err != nil {
+			_ = handle.shutdown(context.Background())
+			return nil, err
+		}
+		return handle, nil
+	}
+}
+
+func newFileAccountStoreHandle(key string, entry *sharedFileAccountStore) *fileAccountStoreHandle {
+	return &fileAccountStoreHandle{
+		key:          key,
+		entry:        entry,
+		shutdownDone: make(chan struct{}),
+	}
+}
+
+func newAccountStoreWithHooks(initial []accountConfig, path string, persistFn accountStorePersistFn, backoffFn func(int) time.Duration, sourceSnapshot []byte) (*fileAccountStore, error) {
+	path = filepath.Clean(path)
 	if persistFn == nil {
-		persistFn = persistAccountsJSONFile
+		persistFn = persistAccountsJSONFileChecked
 	}
 	if backoffFn == nil {
 		backoffFn = defaultAccountStoreBackoff
 	}
 	if err := validateAccountStorePath(path); err != nil {
 		return nil, err
+	}
+	var err error
+	if sourceSnapshot == nil {
+		sourceSnapshot, err = readAccountSemanticSnapshot(path)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		currentSnapshot, err := readAccountSemanticSnapshot(path)
+		if err != nil {
+			return nil, err
+		}
+		if !bytes.Equal(currentSnapshot, sourceSnapshot) {
+			return nil, fmt.Errorf("%w: account source changed during initialization", errAccountStoreIdentityMismatch)
+		}
 	}
 
 	accounts := cloneAccountConfigs(initial)
@@ -75,41 +211,55 @@ func newAccountStoreWithHooks(initial []accountConfig, path string, persistFn fu
 	}
 
 	store := &fileAccountStore{
-		path:         path,
-		accounts:     accounts,
-		positions:    positions,
-		rev:          1,
-		persistedRev: 1,
-		signalCh:     make(chan struct{}, 1),
-		flushCh:      make(chan accountStoreFlushRequest),
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan struct{}),
-		persistFn:    persistFn,
-		backoffFn:    backoffFn,
+		path:              path,
+		accounts:          accounts,
+		positions:         positions,
+		rev:               1,
+		persistedRev:      1,
+		signalCh:          make(chan struct{}, 1),
+		flushCh:           make(chan accountStoreFlushRequest),
+		stopCh:            make(chan struct{}),
+		doneCh:            make(chan struct{}),
+		backoffFn:         backoffFn,
+		persistedSnapshot: sourceSnapshot,
+		persistSnapshotFn: persistFn,
 	}
 	go store.run()
 	return store, nil
 }
 
-func persistAccountsJSONFile(path string, payload string) error {
+func persistAccountsJSONFileChecked(path string, payload string, expectedSnapshot []byte) ([]byte, error) {
 	if !filepath.IsAbs(path) {
-		return fmt.Errorf("google_drive: accounts_json must be an absolute path")
+		return nil, fmt.Errorf("google_drive: accounts_json must be an absolute path")
 	}
 
 	existingContent, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("google_drive: read accounts_json file: %w", err)
+		return nil, fmt.Errorf("google_drive: read accounts_json file: %w", err)
+	}
+	if expectedSnapshot != nil {
+		actualSnapshot, err := semanticAccountsSnapshot(existingContent)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read current account snapshot: %v", errAccountStoreIdentityMismatch, err)
+		}
+		if !bytes.Equal(actualSnapshot, expectedSnapshot) {
+			return nil, fmt.Errorf("%w: on-disk account snapshot changed", errAccountStoreIdentityMismatch)
+		}
 	}
 
 	mergedPayload, err := mergePersistedAccountsJSON(existingContent, payload)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	intendedSnapshot, err := semanticAccountsSnapshot([]byte(mergedPayload))
+	if err != nil {
+		return nil, fmt.Errorf("google_drive: build persisted account snapshot: %w", err)
 	}
 
 	dir := filepath.Dir(path)
 	tmpFile, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("google_drive: create accounts_json temp file: %w", err)
+		return nil, fmt.Errorf("google_drive: create accounts_json temp file: %w", err)
 	}
 	tmpPath := tmpFile.Name()
 	cleanup := true
@@ -121,24 +271,73 @@ func persistAccountsJSONFile(path string, payload string) error {
 
 	if err := tmpFile.Chmod(0o600); err != nil {
 		_ = tmpFile.Close()
-		return fmt.Errorf("google_drive: chmod accounts_json temp file: %w", err)
+		return nil, fmt.Errorf("google_drive: chmod accounts_json temp file: %w", err)
 	}
 	if _, err := tmpFile.WriteString(mergedPayload); err != nil {
 		_ = tmpFile.Close()
-		return fmt.Errorf("google_drive: write accounts_json temp file: %w", err)
+		return nil, fmt.Errorf("google_drive: write accounts_json temp file: %w", err)
 	}
 	if err := tmpFile.Sync(); err != nil {
 		_ = tmpFile.Close()
-		return fmt.Errorf("google_drive: sync accounts_json temp file: %w", err)
+		return nil, fmt.Errorf("google_drive: sync accounts_json temp file: %w", err)
 	}
 	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("google_drive: close accounts_json temp file: %w", err)
+		return nil, fmt.Errorf("google_drive: close accounts_json temp file: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("google_drive: replace accounts_json file: %w", err)
+		return nil, fmt.Errorf("google_drive: replace accounts_json file: %w", err)
 	}
 	cleanup = false
-	return nil
+	return intendedSnapshot, nil
+}
+
+func readAccountSemanticSnapshot(path string) ([]byte, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("google_drive: read accounts_json file: %w", err)
+	}
+	return semanticAccountsSnapshot(content)
+}
+
+func semanticAccountsSnapshot(content []byte) ([]byte, error) {
+	entries, _, _, err := decodeAccountsJSONObjects(content)
+	if err != nil {
+		return nil, err
+	}
+	canonicalEntries := make([]any, 0, len(entries))
+	for _, entry := range entries {
+		entry = cloneJSONEntry(entry)
+		if rawName, ok := entry["name"]; ok {
+			var name string
+			if err := json.Unmarshal(rawName, &name); err == nil {
+				trimmedName, err := json.Marshal(strings.TrimSpace(name))
+				if err != nil {
+					return nil, fmt.Errorf("google_drive: marshal account name snapshot: %w", err)
+				}
+				entry["name"] = trimmedName
+			}
+		}
+		rawEntry, err := json.Marshal(entry)
+		if err != nil {
+			return nil, fmt.Errorf("google_drive: marshal account snapshot: %w", err)
+		}
+		var value any
+		decoder := json.NewDecoder(bytes.NewReader(rawEntry))
+		decoder.UseNumber()
+		if err := decoder.Decode(&value); err != nil {
+			return nil, fmt.Errorf("google_drive: parse account snapshot: %w", err)
+		}
+		canonicalEntries = append(canonicalEntries, value)
+	}
+	return json.Marshal(canonicalEntries)
+}
+
+func cloneJSONEntry(entry map[string]json.RawMessage) map[string]json.RawMessage {
+	clone := make(map[string]json.RawMessage, len(entry))
+	for key, value := range entry {
+		clone[key] = append(json.RawMessage(nil), value...)
+	}
+	return clone
 }
 
 func decodeAccountsJSONObjects(content []byte) ([]map[string]json.RawMessage, accountsJSONFormat, bool, error) {
@@ -216,8 +415,19 @@ func mergePersistedCredentialFields(existing, updated map[string]json.RawMessage
 			delete(existing, field)
 			continue
 		}
+		if current, ok := existing[field]; ok && equalJSONRaw(current, value) {
+			continue
+		}
 		existing[field] = append(json.RawMessage(nil), value...)
 	}
+}
+
+func equalJSONRaw(left, right json.RawMessage) bool {
+	var leftValue, rightValue any
+	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
+		return false
+	}
+	return reflect.DeepEqual(leftValue, rightValue)
 }
 
 func mergePersistedAccountsJSON(existingContent []byte, updatedPayload string) (string, error) {
@@ -230,10 +440,21 @@ func mergePersistedAccountsJSON(existingContent []byte, updatedPayload string) (
 		return "", err
 	}
 	if len(existingEntries) != len(updatedEntries) {
-		return "", fmt.Errorf("google_drive: accounts_json entry count changed from %d to %d", len(existingEntries), len(updatedEntries))
+		return "", fmt.Errorf("%w: entry count changed from %d to %d", errAccountStoreIdentityMismatch, len(existingEntries), len(updatedEntries))
 	}
 
 	for i := range existingEntries {
+		existingName, err := persistedAccountName(existingEntries[i])
+		if err != nil {
+			return "", fmt.Errorf("%w at entry %d: %v", errAccountStoreIdentityMismatch, i, err)
+		}
+		updatedName, err := persistedAccountName(updatedEntries[i])
+		if err != nil {
+			return "", fmt.Errorf("%w at entry %d: %v", errAccountStoreIdentityMismatch, i, err)
+		}
+		if existingName != updatedName {
+			return "", fmt.Errorf("%w at entry %d: %q changed to %q", errAccountStoreIdentityMismatch, i, existingName, updatedName)
+		}
 		if existingEntries[i] == nil {
 			existingEntries[i] = make(map[string]json.RawMessage)
 		}
@@ -241,6 +462,21 @@ func mergePersistedAccountsJSON(existingContent []byte, updatedPayload string) (
 	}
 
 	return encodeAccountsJSONObjects(existingEntries, format, hasTrailingNewline)
+}
+
+func persistedAccountName(entry map[string]json.RawMessage) (string, error) {
+	if entry == nil {
+		return "", nil
+	}
+	rawName, ok := entry["name"]
+	if !ok {
+		return "", nil
+	}
+	var name string
+	if err := json.Unmarshal(rawName, &name); err != nil {
+		return "", fmt.Errorf("name must be a string: %w", err)
+	}
+	return strings.TrimSpace(name), nil
 }
 
 func (s *fileAccountStore) setToken(index int, tokenJSON string) {
@@ -262,6 +498,91 @@ func (s *fileAccountStore) setToken(index int, tokenJSON string) {
 	case s.signalCh <- struct{}{}:
 	default:
 	}
+}
+
+func (s *fileAccountStore) validateAttachment(initial []accountConfig, sourceSnapshot []byte) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return context.Canceled
+	}
+	if !bytes.Equal(sourceSnapshot, s.persistedSnapshot) {
+		return fmt.Errorf("%w: shared writer snapshot differs", errAccountStoreIdentityMismatch)
+	}
+	if !accountStoreLayoutsMatch(s.accounts, initial) {
+		return fmt.Errorf("%w: shared writer entry layout differs", errAccountStoreIdentityMismatch)
+	}
+	return nil
+}
+
+func accountStoreLayoutsMatch(current, incoming []accountConfig) bool {
+	if len(current) != len(incoming) {
+		return false
+	}
+	for index := range current {
+		left, right := current[index], incoming[index]
+		if left.Index != right.Index || strings.TrimSpace(left.Name) != strings.TrimSpace(right.Name) ||
+			strings.TrimSpace(left.PersistClientID) != strings.TrimSpace(right.PersistClientID) ||
+			strings.TrimSpace(left.PersistClientSecret) != strings.TrimSpace(right.PersistClientSecret) {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *fileAccountStoreHandle) setToken(index int, tokenJSON string) {
+	h.entry.core.setToken(index, tokenJSON)
+}
+
+func (h *fileAccountStoreHandle) flush(ctx context.Context) error {
+	return h.entry.core.flush(ctx)
+}
+
+func (h *fileAccountStoreHandle) shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h.shutdownOnce.Do(func() {
+		go func() {
+			h.shutdownErr = releaseFileAccountStore(h.key, h.entry, ctx)
+			close(h.shutdownDone)
+		}()
+	})
+	select {
+	case <-h.shutdownDone:
+		return h.shutdownErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseFileAccountStore(key string, entry *sharedFileAccountStore, ctx context.Context) error {
+	sharedFileAccountStores.Lock()
+	current := sharedFileAccountStores.entries[key]
+	if current == nil || current != entry {
+		sharedFileAccountStores.Unlock()
+		return nil
+	}
+	entry.refs--
+	if entry.refs > 0 {
+		sharedFileAccountStores.Unlock()
+		return nil
+	}
+	entry.closing = true
+	sharedFileAccountStores.Unlock()
+
+	err := entry.core.shutdown(ctx)
+	// Keep the path registered as closing until the writer goroutine has
+	// stopped, so an attachment cannot create a second writer during shutdown.
+	<-entry.core.doneCh
+
+	sharedFileAccountStores.Lock()
+	if sharedFileAccountStores.entries[key] == entry {
+		delete(sharedFileAccountStores.entries, key)
+		close(entry.done)
+	}
+	sharedFileAccountStores.Unlock()
+	return err
 }
 
 func (s *fileAccountStore) flush(ctx context.Context) error {
@@ -370,7 +691,19 @@ func (s *fileAccountStore) persistPending(targetRev uint64) error {
 		if err != nil {
 			return err
 		}
-		if err := s.persistFn(s.path, payload); err != nil {
+		expectedSnapshot := s.expectedSnapshot()
+		actualSnapshot, err := readAccountSemanticSnapshot(s.path)
+		if err != nil {
+			return fmt.Errorf("%w: read current account snapshot: %v", errAccountStoreIdentityMismatch, err)
+		}
+		if !bytes.Equal(actualSnapshot, expectedSnapshot) {
+			return fmt.Errorf("%w: on-disk account snapshot changed", errAccountStoreIdentityMismatch)
+		}
+		acknowledgedSnapshot, err := s.persistSnapshotFn(s.path, payload, expectedSnapshot)
+		if err != nil {
+			if errors.Is(err, errAccountStoreIdentityMismatch) {
+				return err
+			}
 			attempt++
 			log.WithError(err).Warn("google_drive: accounts_json persist failed")
 			if !s.waitBackoff(attempt) {
@@ -378,8 +711,10 @@ func (s *fileAccountStore) persistPending(targetRev uint64) error {
 			}
 			continue
 		}
-
-		s.markPersisted(currentRev)
+		if len(acknowledgedSnapshot) == 0 {
+			return fmt.Errorf("google_drive: account persistence returned an empty snapshot acknowledgment")
+		}
+		s.markPersisted(currentRev, acknowledgedSnapshot)
 		attempt = 0
 		if targetRev > 0 {
 			_, persistedAfterWrite := s.currentRevisions()
@@ -427,11 +762,18 @@ func (s *fileAccountStore) currentRevisions() (uint64, uint64) {
 	return s.rev, s.persistedRev
 }
 
-func (s *fileAccountStore) markPersisted(rev uint64) {
+func (s *fileAccountStore) expectedSnapshot() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]byte(nil), s.persistedSnapshot...)
+}
+
+func (s *fileAccountStore) markPersisted(rev uint64, snapshot []byte) {
 	s.mu.Lock()
 	if rev > s.persistedRev {
 		s.persistedRev = rev
 	}
+	s.persistedSnapshot = append([]byte(nil), snapshot...)
 	s.mu.Unlock()
 }
 

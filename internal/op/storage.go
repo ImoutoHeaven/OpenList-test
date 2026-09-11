@@ -281,21 +281,25 @@ func DeleteStorageById(ctx context.Context, id uint) error {
 
 // MustSaveDriverStorage call from specific driver
 func MustSaveDriverStorage(driver driver.Driver) {
-	err := saveDriverStorage(driver)
+	err := SaveDriverStorageWithContext(context.Background(), driver)
 	if err != nil {
 		log.Errorf("failed save driver storage: %s", err)
 	}
 }
 
-func saveDriverStorage(driver driver.Driver) error {
-	storage := driver.GetStorage()
-	addition := driver.GetAddition()
+// SaveDriverStorageWithContext saves driver state with the caller's context.
+func SaveDriverStorageWithContext(ctx context.Context, storageDriver driver.Driver) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	storage := storageDriver.GetStorage()
+	addition := storageDriver.GetAddition()
 	str, err := utils.Json.MarshalToString(addition)
 	if err != nil {
 		return errors.Wrap(err, "error while marshal addition")
 	}
 	storage.Addition = str
-	err = db.UpdateStorage(storage)
+	err = db.UpdateStorageContext(ctx, storage)
 	if err != nil {
 		return errors.WithMessage(err, "failed update storage in database")
 	}

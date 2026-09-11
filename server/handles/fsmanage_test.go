@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +33,11 @@ func init() {
 	}
 	conf.Conf = conf.DefaultConfig("data")
 	db.Init(dB)
+	if _, err := op.GetSettingItemByKey(conf.Token); err != nil {
+		if err := op.SaveSettingItem(&model.SettingItem{Key: conf.Token, Value: "link-api-test-token"}); err != nil {
+			panic("failed to seed link API signing token")
+		}
+	}
 	gin.SetMode(gin.TestMode)
 }
 
@@ -49,9 +55,9 @@ func TestLinkHandler_ReturnsLeafDirectURLWithoutPProxyFallback(t *testing.T) {
 	})
 
 	recorder := callLinkHandler(t, linkHandlerRequest{
-		path:      storage.MountPath + "/file.bin",
-		bodyJSON:  `{"path":"` + storage.MountPath + `/file.bin","refresh":false}`,
-		rawQuery:  "type=download&refresh=1",
+		path:       storage.MountPath + "/file.bin",
+		bodyJSON:   `{"action":"acquire","path":"` + storage.MountPath + `/file.bin","refresh":false}`,
+		rawQuery:   "type=download&refresh=1",
 		remoteAddr: "203.0.113.9:3456",
 		headers: http.Header{
 			"Content-Type":  []string{"application/json"},
@@ -77,6 +83,12 @@ func TestLinkHandler_ReturnsLeafDirectURLWithoutPProxyFallback(t *testing.T) {
 	}
 	if got, want := link.URL, "https://download.example.com/file.bin"; got != want {
 		t.Fatalf("expected direct leaf URL %q, got %q", want, got)
+	}
+	if link.Download == nil || link.Download.Provider == "" || link.Download.Ticket == "" || link.Download.ExpiresAt <= time.Now().Unix() {
+		t.Fatalf("expected signed download envelope, got %+v", link.Download)
+	}
+	if got, want := link.Size, int64(1); got != want {
+		t.Fatalf("expected authoritative size %d, got %d", want, got)
 	}
 	if got, want := link.Header.Get("Authorization"), "Bearer token"; got != want {
 		t.Fatalf("expected Authorization header %q, got %q", want, got)
@@ -156,15 +168,15 @@ func TestLinkHandler_ReturnsJSONErrorWhenLeafHasNoExternalURLAndNoDownProxyURL(t
 
 	recorder := callLinkHandler(t, linkHandlerRequest{
 		path:       storage.MountPath + "/stream-only.bin",
-		bodyJSON:   `{"path":"` + storage.MountPath + `/stream-only.bin","refresh":true}`,
+		bodyJSON:   `{"action":"acquire","path":"` + storage.MountPath + `/stream-only.bin","refresh":true}`,
 		remoteAddr: "198.51.100.44:9876",
 		headers: http.Header{
 			"Content-Type": []string{"application/json"},
 		},
 	})
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("expected HTTP 200, got %d with body %s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500, got %d with body %s", recorder.Code, recorder.Body.String())
 	}
 
 	resp := decodeLinkHandlerResp(t, recorder)
@@ -179,6 +191,153 @@ func TestLinkHandler_ReturnsJSONErrorWhenLeafHasNoExternalURLAndNoDownProxyURL(t
 	}
 	if resp.Message == "" {
 		t.Fatal("expected non-empty error message")
+	}
+}
+
+func TestLinkHandler_ReportOnlyAcceptsSignedGenericTicketWithoutReplacement(t *testing.T) {
+	storage := mustCreateLinkHandlerTestStorage(t, uniqueLinkHandlerMountPath(t), linkHandlerStubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/file.bin"}, nil
+		},
+	})
+	path := storage.MountPath + "/file.bin"
+	acquire := callLinkHandler(t, linkHandlerRequest{
+		path:     path,
+		bodyJSON: `{"action":"acquire","path":"` + path + `"}`,
+		headers:  http.Header{"Content-Type": []string{"application/json"}},
+	})
+	acquireResp := decodeLinkHandlerResp(t, acquire)
+	if acquireResp.Code != http.StatusOK {
+		t.Fatalf("expected acquire success, got %s", acquire.Body.String())
+	}
+	var link model.Link
+	if err := json.Unmarshal(acquireResp.Data, &link); err != nil {
+		t.Fatalf("failed to decode acquired link: %v", err)
+	}
+	if link.Download == nil {
+		t.Fatal("expected acquired link ticket")
+	}
+	replacement := callLinkHandler(t, linkHandlerRequest{
+		path:     path,
+		bodyJSON: `{"action":"acquire","path":"` + path + `","feedback":{"ticket":"` + link.Download.Ticket + `","event_id":"generic-failure-1","outcome":"failure","status_code":500,"reason":"upstream failed"},"exclude":["` + link.Download.Ticket + `"]}`,
+		headers:  http.Header{"Content-Type": []string{"application/json"}},
+	})
+	replacementResp := decodeLinkHandlerResp(t, replacement)
+	if replacementResp.Code != http.StatusOK {
+		t.Fatalf("expected replacement acquire success, got %s", replacement.Body.String())
+	}
+	var replacementLink model.Link
+	if err := json.Unmarshal(replacementResp.Data, &replacementLink); err != nil {
+		t.Fatalf("failed to decode replacement link: %v", err)
+	}
+	if replacementLink.Download == nil || !replacementLink.Download.ReportSuccess {
+		t.Fatalf("expected generic recovery authorization to request success reporting, got %+v", replacementLink.Download)
+	}
+
+	report := callLinkHandler(t, linkHandlerRequest{
+		path:     path,
+		bodyJSON: `{"action":"report","path":"` + path + `","feedback":{"ticket":"` + replacementLink.Download.Ticket + `","event_id":"generic-report-1","outcome":"failure","status_code":500,"reason":"upstream failed"}}`,
+		headers:  http.Header{"Content-Type": []string{"application/json"}},
+	})
+	reportResp := decodeLinkHandlerResp(t, report)
+	if reportResp.Code != http.StatusOK {
+		t.Fatalf("expected report success, got %s", report.Body.String())
+	}
+	var reportData struct {
+		Applied bool `json:"applied"`
+	}
+	if err := json.Unmarshal(reportResp.Data, &reportData); err != nil {
+		t.Fatalf("failed to decode report result: %v", err)
+	}
+	if !reportData.Applied {
+		t.Fatal("expected generic report to be acknowledged")
+	}
+	if got, want := storage.linkCalls, 2; got != want {
+		t.Fatalf("expected report-only operation to issue no replacement link, got %d link calls", got)
+	}
+}
+
+func TestLinkHandler_RequiresExplicitAction(t *testing.T) {
+	recorder := callLinkHandler(t, linkHandlerRequest{
+		path:     "/missing/file.bin",
+		bodyJSON: `{"path":"/missing/file.bin"}`,
+		headers:  http.Header{"Content-Type": []string{"application/json"}},
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected missing action HTTP 400, got %d with body %s", recorder.Code, recorder.Body.String())
+	}
+	resp := decodeLinkHandlerResp(t, recorder)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("expected missing action to return code %d, got %d", http.StatusBadRequest, resp.Code)
+	}
+}
+
+func TestLinkHandler_MissingPathReturnsBadRequest(t *testing.T) {
+	recorder := callLinkHandler(t, linkHandlerRequest{
+		bodyJSON: `{"action":"acquire"}`,
+		headers:  http.Header{"Content-Type": []string{"application/json"}},
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected missing path HTTP 400, got %d with body %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestLinkHandler_FailsClosedWhenDownloadSigningKeyIsUnavailable(t *testing.T) {
+	storage := mustCreateLinkHandlerTestStorage(t, uniqueLinkHandlerMountPath(t), linkHandlerStubBehavior{
+		files: []string{"/file.bin"},
+		link: func(model.Obj, model.LinkArgs) (*model.Link, error) {
+			return &model.Link{URL: "https://download.example.com/file.bin"}, nil
+		},
+	})
+	item, err := op.GetSettingItemByKey(conf.Token)
+	if err != nil {
+		t.Fatalf("failed to read signing token: %v", err)
+	}
+	original := *item
+	t.Cleanup(func() {
+		copy := original
+		if err := op.SaveSettingItem(&copy); err != nil {
+			t.Errorf("failed to restore signing token: %v", err)
+		}
+	})
+	empty := original
+	empty.Value = ""
+	if err := op.SaveSettingItem(&empty); err != nil {
+		t.Fatalf("failed to clear signing token: %v", err)
+	}
+
+	path := storage.MountPath + "/file.bin"
+	recorder := callLinkHandler(t, linkHandlerRequest{
+		path:     path,
+		bodyJSON: `{"action":"acquire","path":"` + path + `"}`,
+		headers:  http.Header{"Content-Type": []string{"application/json"}},
+	})
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected missing signing key HTTP 500, got %d with body %s", recorder.Code, recorder.Body.String())
+	}
+	if got := storage.linkCalls; got != 0 {
+		t.Fatalf("expected missing signing key to stop before Link, got %d calls", got)
+	}
+}
+
+func TestLinkHandler_UnavailablePoolReturnsHTTP503AndRetryAfter(t *testing.T) {
+	mountPath := uniqueLinkHandlerMountPath(t)
+	driver := mustCreateUnavailableLinkHandlerStorage(t, mountPath)
+	path := mountPath + "/file.bin"
+	recorder := callLinkHandler(t, linkHandlerRequest{
+		path:     path,
+		bodyJSON: `{"action":"acquire","path":"` + path + `"}`,
+		headers:  http.Header{"Content-Type": []string{"application/json"}},
+	})
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected unavailable HTTP 503, got %d with body %s", recorder.Code, recorder.Body.String())
+	}
+	if got, want := recorder.Header().Get("Retry-After"), "42"; got != want {
+		t.Fatalf("expected Retry-After %q, got %q", want, got)
+	}
+	if got := driver.acquireCalls.Load(); got != 1 {
+		t.Fatalf("expected one unavailable authorization attempt, got %d", got)
 	}
 }
 
@@ -424,3 +583,55 @@ func cloneLinkHandlerObject(obj *model.Object) *model.Object {
 
 var _ driverpkg.Driver = (*linkHandlerStubDriver)(nil)
 var _ driverpkg.Getter = (*linkHandlerStubDriver)(nil)
+
+const unavailableLinkHandlerStubDriverName = "TestLinkHandlerUnavailableAuthorizer"
+
+var registerUnavailableLinkHandlerStubOnce sync.Once
+
+func mustCreateUnavailableLinkHandlerStorage(t *testing.T, mountPath string) *unavailableLinkHandlerDriver {
+	t.Helper()
+	registerUnavailableLinkHandlerStubOnce.Do(func() {
+		op.RegisterDriver(func() driverpkg.Driver { return &unavailableLinkHandlerDriver{} })
+	})
+	linkHandlerFixtures.Lock()
+	linkHandlerFixtures.byMountPath[mountPath] = linkHandlerStubBehavior{files: []string{"/file.bin"}}
+	linkHandlerFixtures.Unlock()
+	t.Cleanup(func() {
+		linkHandlerFixtures.Lock()
+		delete(linkHandlerFixtures.byMountPath, mountPath)
+		linkHandlerFixtures.Unlock()
+	})
+	drv := mustCreateLinkHandlerStorage(t, model.Storage{
+		MountPath: mountPath,
+		Driver:    unavailableLinkHandlerStubDriverName,
+		Addition:  mustMarshalLinkHandlerAddition(t, driverpkg.RootPath{RootFolderPath: "/"}),
+	})
+	result, ok := drv.(*unavailableLinkHandlerDriver)
+	if !ok {
+		t.Fatalf("expected unavailable authorizer driver, got %T", drv)
+	}
+	return result
+}
+
+type unavailableLinkHandlerDriver struct {
+	linkHandlerStubDriver
+	acquireCalls atomic.Int32
+}
+
+func (d *unavailableLinkHandlerDriver) Config() driverpkg.Config {
+	return driverpkg.Config{Name: unavailableLinkHandlerStubDriverName, DefaultRoot: "/"}
+}
+
+func (d *unavailableLinkHandlerDriver) AcquireDownloadAuthorization(context.Context, driverpkg.DownloadAuthorizationRequest) (driverpkg.DownloadAuthorizationResult, error) {
+	d.acquireCalls.Add(1)
+	return driverpkg.DownloadAuthorizationResult{}, &driverpkg.DownloadAuthorizationUnavailableError{
+		Reason:     "account pool unavailable",
+		RetryAfter: 42 * time.Second,
+	}
+}
+
+func (d *unavailableLinkHandlerDriver) ReportDownloadAuthorization(context.Context, driverpkg.DownloadAuthorizationReport) (driverpkg.DownloadAuthorizationReportResult, error) {
+	return driverpkg.DownloadAuthorizationReportResult{Applied: true}, nil
+}
+
+var _ driverpkg.DownloadAuthorizer = (*unavailableLinkHandlerDriver)(nil)

@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
@@ -41,16 +42,73 @@ type googleDriveServiceAccount struct {
 	// ClientX509CertURL       string `json:"client_x509_cert_url"`
 }
 
-func (d *GoogleDrive) refreshToken() error {
+func (d *GoogleDrive) refreshTokenWithContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := lockAccountHealthMutex(ctx, &d.singleRefreshMu); err != nil {
+		return err
+	}
+	defer d.singleRefreshMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return d.refreshTokenLocked(ctx)
+}
+
+func (d *GoogleDrive) refreshTokenIfNeededWithContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := lockAccountHealthMutex(ctx, &d.singleRefreshMu); err != nil {
+		return err
+	}
+	defer d.singleRefreshMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	d.accountStateMu.Lock()
+	if d.singleCredentialGeneration == 0 {
+		d.singleCredentialGeneration = 1
+	}
+	accessToken := d.AccessToken
+	generation := d.singleCredentialGeneration
+	invalidGeneration := d.singleInvalidCredentialGeneration
+	tokenExpiryValue := d.singleTokenExpiry
+	d.accountStateMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(accessToken) != "" && invalidGeneration != generation && !tokenExpiresSoon(tokenExpiryValue, time.Now()) {
+		return nil
+	}
+	return d.refreshTokenLocked(ctx)
+}
+
+func (d *GoogleDrive) refreshTokenLocked(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// 使用在线API刷新Token，无需ClientID和ClientSecret
 	if d.UseOnlineAPI && len(d.APIAddress) > 0 {
 		u := d.APIAddress
 		var resp struct {
 			RefreshToken string `json:"refresh_token"`
 			AccessToken  string `json:"access_token"`
+			ExpiresIn    int    `json:"expires_in"`
 			ErrorMessage string `json:"text"`
 		}
 		_, err := base.RestyClient.R().
+			SetContext(ctx).
 			SetHeader("User-Agent", "Mozilla/5.0 (Macintosh; Apple macOS 15_5) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36 Chrome/138.0.0.0 Openlist/425.6.30").
 			SetResult(&resp).
 			SetQueryParams(map[string]string{
@@ -68,10 +126,11 @@ func (d *GoogleDrive) refreshToken() error {
 			}
 			return fmt.Errorf("empty token returned from official API, a wrong refresh token may have been used")
 		}
-		d.setAccessToken(resp.AccessToken)
-		d.RefreshToken = resp.RefreshToken
-		op.MustSaveDriverStorage(d)
-		return nil
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		d.installSingleCredential(resp.AccessToken, resp.RefreshToken, refreshExpiry(resp.ExpiresIn))
+		return op.SaveDriverStorageWithContext(ctx, d)
 	}
 	// 使用本地客户端的情况下检查是否为空
 	if d.ClientID == "" || d.ClientSecret == "" {
@@ -152,9 +211,12 @@ func (d *GoogleDrive) refreshToken() error {
 			return err
 		}
 
-		var resp base.TokenResp
+		var resp struct {
+			AccessToken string `json:"access_token"`
+			ExpiresIn   int    `json:"expires_in"`
+		}
 		var e TokenError
-		res, err := base.RestyClient.R().SetResult(&resp).SetError(&e).
+		res, err := base.RestyClient.R().SetContext(ctx).SetResult(&resp).SetError(&e).
 			SetFormData(map[string]string{
 				"assertion":  assertion,
 				"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
@@ -166,15 +228,25 @@ func (d *GoogleDrive) refreshToken() error {
 		if e.Error != "" {
 			return fmt.Errorf(e.Error)
 		}
-		d.setAccessToken(resp.AccessToken)
+		if strings.TrimSpace(resp.AccessToken) == "" {
+			return fmt.Errorf("empty token returned from service account API")
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		d.installSingleCredential(resp.AccessToken, "", refreshExpiry(resp.ExpiresIn))
 		return nil
 	} else if os.IsExist(gdsaFileErr) {
 		return gdsaFileErr
 	}
 	url := "https://www.googleapis.com/oauth2/v4/token"
-	var resp base.TokenResp
+	var resp struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
 	var e TokenError
-	res, err := base.RestyClient.R().SetResult(&resp).SetError(&e).
+	res, err := base.RestyClient.R().SetContext(ctx).SetResult(&resp).SetError(&e).
 		SetFormData(map[string]string{
 			"client_id":     d.ClientID,
 			"client_secret": d.ClientSecret,
@@ -188,14 +260,27 @@ func (d *GoogleDrive) refreshToken() error {
 	if e.Error != "" {
 		return fmt.Errorf(e.Error)
 	}
-	d.setAccessToken(resp.AccessToken)
+	if strings.TrimSpace(resp.AccessToken) == "" {
+		return fmt.Errorf("empty token returned from oauth API")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	d.installSingleCredential(resp.AccessToken, resp.RefreshToken, refreshExpiry(resp.ExpiresIn))
 	return nil
 }
 
 func (d *GoogleDrive) request(url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	return d.requestWithContext(context.Background(), url, method, callback, resp)
+}
+
+func (d *GoogleDrive) requestWithContext(ctx context.Context, url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if d.modeCfg.Enabled {
 		if method == http.MethodGet {
-			return d.requestReadWithRotation(context.Background(), url, method, callback, resp)
+			return d.requestReadWithRotation(ctx, url, method, callback, resp)
 		}
 		if err := d.syncPrimaryAccessToken(); err != nil {
 			return nil, err
@@ -204,7 +289,7 @@ func (d *GoogleDrive) request(url string, method string, callback base.ReqCallba
 		if err != nil {
 			return nil, err
 		}
-		body, statusCode, err := executeRequestWithToken(context.Background(), accessToken, url, method, callback, resp)
+		body, statusCode, err := executeRequestWithToken(ctx, accessToken, url, method, callback, resp)
 		if err != nil {
 			return nil, err
 		}
@@ -212,14 +297,14 @@ func (d *GoogleDrive) request(url string, method string, callback base.ReqCallba
 			return body, nil
 		}
 		if statusCode == http.StatusUnauthorized {
-			if err := d.refreshPrimaryAccount(context.Background()); err != nil {
+			if err := d.refreshPrimaryAccount(ctx); err != nil {
 				return nil, err
 			}
 			accessToken, err = d.primaryAccessToken()
 			if err != nil {
 				return nil, err
 			}
-			body, statusCode, err = executeRequestWithToken(context.Background(), accessToken, url, method, callback, resp)
+			body, statusCode, err = executeRequestWithToken(ctx, accessToken, url, method, callback, resp)
 			if err != nil {
 				return nil, err
 			}
@@ -231,6 +316,7 @@ func (d *GoogleDrive) request(url string, method string, callback base.ReqCallba
 	}
 
 	req := base.RestyClient.R()
+	req.SetContext(ctx)
 	req.SetHeader("Authorization", "Bearer "+d.currentAccessToken())
 	req.SetQueryParam("includeItemsFromAllDrives", "true")
 	req.SetQueryParam("supportsAllDrives", "true")
@@ -248,11 +334,11 @@ func (d *GoogleDrive) request(url string, method string, callback base.ReqCallba
 	}
 	if e.Error.Code != 0 {
 		if e.Error.Code == 401 {
-			err = d.refreshToken()
+			err = d.repairSingletonCredentialWithContext(ctx)
 			if err != nil {
 				return nil, err
 			}
-			return d.request(url, method, callback, resp)
+			return d.requestWithContext(ctx, url, method, callback, resp)
 		}
 		return nil, fmt.Errorf("%s: %v", e.Error.Message, e.Error.Errors)
 	}
@@ -260,6 +346,13 @@ func (d *GoogleDrive) request(url string, method string, callback base.ReqCallba
 }
 
 func (d *GoogleDrive) getFiles(id string) ([]File, error) {
+	return d.getFilesWithContext(context.Background(), id)
+}
+
+func (d *GoogleDrive) getFilesWithContext(ctx context.Context, id string) ([]File, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	pageToken := "first"
 	res := make([]File, 0)
 	for pageToken != "" {
@@ -280,7 +373,7 @@ func (d *GoogleDrive) getFiles(id string) ([]File, error) {
 			//"supportsAllDrives":         "true",
 			"pageToken": pageToken,
 		}
-		_, err := d.request("https://www.googleapis.com/drive/v3/files", http.MethodGet, func(req *resty.Request) {
+		_, err := d.requestWithContext(ctx, "https://www.googleapis.com/drive/v3/files", http.MethodGet, func(req *resty.Request) {
 			req.SetQueryParams(query)
 		}, &resp)
 		if err != nil {
@@ -294,7 +387,7 @@ func (d *GoogleDrive) getFiles(id string) ([]File, error) {
 
 func (d *GoogleDrive) smallFileUpload(ctx context.Context, file model.FileStreamer, url string) error {
 	if !d.modeCfg.Enabled {
-		_, err := d.request(url, http.MethodPut, func(req *resty.Request) {
+		_, err := d.requestWithContext(ctx, url, http.MethodPut, func(req *resty.Request) {
 			req.SetHeader("Content-Length", strconv.FormatInt(file.GetSize(), 10)).
 				SetBody(driver.NewLimitedUploadStream(ctx, file))
 		}, nil)
@@ -396,7 +489,7 @@ func (d *GoogleDrive) chunkUpload(ctx context.Context, file model.FileStreamer, 
 						}
 						return fmt.Errorf("google_drive: retry primary account chunk after refresh")
 					}
-					err = d.refreshToken()
+					err = d.repairSingletonCredentialWithContext(ctx)
 					if err != nil {
 						return err
 					}
@@ -424,7 +517,7 @@ func (d *GoogleDrive) getAbout(ctx context.Context) (*AboutResp, error) {
 		"fields": "storageQuota",
 	}
 	var resp AboutResp
-	_, err := d.request("https://www.googleapis.com/drive/v3/about", http.MethodGet, func(req *resty.Request) {
+	_, err := d.requestWithContext(ctx, "https://www.googleapis.com/drive/v3/about", http.MethodGet, func(req *resty.Request) {
 		req.SetQueryParams(query)
 		req.SetContext(ctx)
 	}, &resp)

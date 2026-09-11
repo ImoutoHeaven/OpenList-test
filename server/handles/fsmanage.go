@@ -2,10 +2,13 @@ package handles
 
 import (
 	"fmt"
+	"net/http"
 	stdpath "path"
 	"strings"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/task"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -19,8 +22,11 @@ import (
 )
 
 type MkdirOrLinkReq struct {
-	Path    string `json:"path" form:"path"`
-	Refresh bool   `json:"refresh" form:"refresh"`
+	Action   string                  `json:"action" form:"action"`
+	Path     string                  `json:"path" form:"path"`
+	Refresh  bool                    `json:"refresh" form:"refresh"`
+	Feedback *model.DownloadFeedback `json:"feedback" form:"feedback"`
+	Exclude  []string                `json:"exclude" form:"exclude"`
 }
 
 func FsMkdir(c *gin.Context) {
@@ -384,16 +390,59 @@ func Link(c *gin.Context) {
 	if q := c.Query("refresh"); q != "" {
 		refresh = strings.EqualFold(q, "true") || q == "1"
 	}
-	link, err := fs.ResolveActualLink(c.Request.Context(), rawPath, model.LinkArgs{
-		IP:           c.ClientIP(),
-		Header:       c.Request.Header,
-		Type:         c.Query("type"),
-		ForceRefresh: refresh,
+	link, report, err := op.ResolveLinkAPI(c.Request.Context(), op.LinkAPIRequest{
+		Action:   req.Action,
+		Path:     rawPath,
+		Feedback: req.Feedback,
+		Exclude:  req.Exclude,
+		Args: model.LinkArgs{
+			IP:           c.ClientIP(),
+			Header:       c.Request.Header,
+			Type:         c.Query("type"),
+			ForceRefresh: refresh,
+		},
 	})
 	if err != nil {
-		common.ErrorResp(c, err, 500)
+		linkAPIErrorResp(c, err)
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(req.Action), "report") {
+		common.SuccessResp(c, linkAPIReportData(*report))
 		return
 	}
 	defer link.Close()
 	common.SuccessResp(c, link)
+}
+
+func linkAPIReportData(result driver.DownloadAuthorizationReportResult) gin.H {
+	data := gin.H{
+		"applied":        result.Applied,
+		"duplicate":      result.Duplicate,
+		"stale":          result.Stale,
+		"generation":     result.Generation,
+		"cooldown_until": int64(0),
+		"retry_after":    int64(0),
+	}
+	if !result.CooldownUntil.IsZero() {
+		data["cooldown_until"] = result.CooldownUntil.Unix()
+	}
+	if result.RetryAfter > 0 {
+		data["retry_after"] = int64((result.RetryAfter + time.Second - 1) / time.Second)
+	}
+	return data
+}
+
+func linkAPIErrorResp(c *gin.Context, err error) {
+	code := 500
+	if op.IsLinkAPIRequestError(err) {
+		code = http.StatusBadRequest
+	}
+	if retryable, ok := err.(interface{ RetryAfterDuration() time.Duration }); ok {
+		code = http.StatusServiceUnavailable
+		if retryAfter := retryable.RetryAfterDuration(); retryAfter > 0 {
+			seconds := (retryAfter + time.Second - 1) / time.Second
+			c.Header("Retry-After", fmt.Sprintf("%d", seconds))
+		}
+	}
+	common.ErrorStrResp(c, err.Error(), code)
 }

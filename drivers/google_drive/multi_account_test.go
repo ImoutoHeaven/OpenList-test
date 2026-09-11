@@ -64,42 +64,68 @@ func TestGoogleDriveModeConfig_RejectsNegativeRetryAndUnknownPolicy(t *testing.T
 }
 
 func TestGoogleDriveParseAccountsJSON_AcceptsArrayAndJSONL(t *testing.T) {
-	arrayPath := writeTempAccountsFile(t, `[{"token":{"access_token":"a","refresh_token":"ra"}}]`)
-	arrayAccounts, err := parseAccountsJSON(arrayPath, Addition{})
+	arrayPath := writeTempAccountsFile(t, `[{"name":"array-account","token":{"access_token":"a","refresh_token":"ra"}}]`)
+	arrayAccounts, _, err := parseAccountsJSON(arrayPath, Addition{})
 	require.NoError(t, err)
 	require.Len(t, arrayAccounts, 1)
 
-	jsonlPath := writeTempAccountsFile(t, "{\"token\":{\"access_token\":\"a\",\"refresh_token\":\"ra\"}}\n{\"token\":{\"access_token\":\"b\",\"refresh_token\":\"rb\"}}")
-	jsonlAccounts, err := parseAccountsJSON(jsonlPath, Addition{})
+	jsonlPath := writeTempAccountsFile(t, "{\"name\":\"jsonl-account-1\",\"token\":{\"access_token\":\"a\",\"refresh_token\":\"ra\"}}\n{\"name\":\"jsonl-account-2\",\"token\":{\"access_token\":\"b\",\"refresh_token\":\"rb\"}}")
+	jsonlAccounts, _, err := parseAccountsJSON(jsonlPath, Addition{})
 	require.NoError(t, err)
 	require.Len(t, jsonlAccounts, 2)
 }
 
 func TestGoogleDriveParseAccountsJSON_RejectsInvalidContent(t *testing.T) {
-	_, err := parseAccountsJSON(writeTempAccountsFile(t, "[]"), Addition{})
+	_, _, err := parseAccountsJSON(writeTempAccountsFile(t, "[]"), Addition{})
 	require.ErrorContains(t, err, "must not be empty")
 
-	_, err = parseAccountsJSON(writeTempAccountsFile(t, `[{"token":"not-an-object"}]`), Addition{})
+	_, _, err = parseAccountsJSON(writeTempAccountsFile(t, `[{"name":"invalid","token":"not-an-object"}]`), Addition{})
 	require.ErrorContains(t, err, "token must be a JSON object")
 
-	_, err = parseAccountsJSON(writeTempAccountsFile(t, `[{"token":{}}]`), Addition{})
+	_, _, err = parseAccountsJSON(writeTempAccountsFile(t, `[{"name":"invalid","token":{}}]`), Addition{})
 	require.ErrorContains(t, err, "access_token")
 
-	_, err = parseAccountsJSON(writeTempAccountsFile(t, `[{"token":{"foo":"bar"}}]`), Addition{})
+	_, _, err = parseAccountsJSON(writeTempAccountsFile(t, `[{"name":"invalid","token":{"foo":"bar"}}]`), Addition{})
 	require.ErrorContains(t, err, "access_token")
 
-	_, err = parseAccountsJSON(writeTempAccountsFile(t, `[{"token":{"access_token":"a","expiry":"invalid-time"}}]`), Addition{})
+	_, _, err = parseAccountsJSON(writeTempAccountsFile(t, `[{"name":"invalid","token":{"access_token":"a","expiry":"invalid-time"}}]`), Addition{})
 	require.ErrorContains(t, err, "parseable OAuth token JSON")
+}
+
+func TestGoogleDriveParseAccountsJSON_RejectsEmptyAccountName(t *testing.T) {
+	for _, name := range []string{"", "   \t"} {
+		_, _, err := parseAccountsJSON(writeTempAccountsFile(t, fmt.Sprintf(`[{"name":%q,"token":{"access_token":"a","refresh_token":"ra"}}]`, name)), Addition{})
+		require.ErrorContains(t, err, "account name must be nonempty")
+	}
+}
+
+func TestGoogleDriveAccountsJSON_RejectsSourceEditBetweenParseAndStore(t *testing.T) {
+	path := writeTempAccountsFile(t, `[
+		{"name":"first","token":{"access_token":"first-token","refresh_token":"first-refresh"}},
+		{"name":"same","token":{"access_token":"duplicate-token","refresh_token":"duplicate-refresh"}}
+	]`)
+	accounts, sourceSnapshot, err := parseAccountsJSON(path, Addition{})
+	require.NoError(t, err)
+	updated := `[
+		{"name":"first","token":{"access_token":"changed-token","refresh_token":"first-refresh"}},
+		{"name":"same","token":{"access_token":"duplicate-token","refresh_token":"duplicate-refresh"}}
+	]`
+	require.NoError(t, os.WriteFile(path, []byte(updated), 0o600))
+	_, err = newAccountStore(accounts, path, sourceSnapshot)
+	require.ErrorIs(t, err, errAccountStoreIdentityMismatch)
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, updated, string(content))
 }
 
 func TestGoogleDriveParseAccountsJSON_AppliesNameAndCredentialFallbacks(t *testing.T) {
 	path := writeTempAccountsFile(t, `[
-		{"token":{"access_token":"a","refresh_token":"ra"}},
+		{"name":" first ","token":{"access_token":"a","refresh_token":"ra"}},
 		{"name":"named","client_id":"entry-id","client_secret":"entry-secret","token":{"access_token":"b","refresh_token":"rb"}}
 	]`)
-	accounts, err := parseAccountsJSON(path, Addition{ClientID: "driver-id", ClientSecret: "driver-secret"})
+	accounts, _, err := parseAccountsJSON(path, Addition{ClientID: "driver-id", ClientSecret: "driver-secret"})
 	require.NoError(t, err)
-	require.Equal(t, "account-0", accounts[0].Name)
+	require.Equal(t, "first", accounts[0].Name)
 	require.Equal(t, "driver-id", accounts[0].ClientID)
 	require.Equal(t, "driver-secret", accounts[0].ClientSecret)
 	require.Equal(t, "named", accounts[1].Name)
@@ -109,8 +135,8 @@ func TestGoogleDriveParseAccountsJSON_AppliesNameAndCredentialFallbacks(t *testi
 
 func TestGoogleDriveInitAccountsJSONMode_BootstrapsPrimaryAccountToken(t *testing.T) {
 	path := writeTempAccountsFile(t, `[
-		{"token":{"access_token":"primary-token","refresh_token":"r0"}},
-		{"token":{"access_token":"secondary-token","refresh_token":"r1"}}
+		{"name":"primary","token":{"access_token":"primary-token","refresh_token":"r0"}},
+		{"name":"secondary","token":{"access_token":"secondary-token","refresh_token":"r1"}}
 	]`)
 
 	d := &GoogleDrive{Addition: Addition{AccountsJSON: path}}
@@ -122,6 +148,7 @@ func TestGoogleDriveInitAccountsJSONMode_BootstrapsPrimaryAccountToken(t *testin
 	}
 
 	require.NoError(t, d.initAccountsJSONMode(context.Background()))
+	t.Cleanup(func() { _ = d.Drop(context.Background()) })
 	require.Len(t, d.accounts, 2)
 	require.Equal(t, "primary-token", d.AccessToken)
 }
@@ -212,7 +239,7 @@ func TestGoogleDrivePrimaryAccountRouting_ListRotatesAfterSuccessful401RefreshSt
 	require.Equal(t, "refreshed-primary-token", d.accounts[0].Token.AccessToken)
 	require.Equal(t, "refresh-0-next", d.accounts[0].Token.RefreshToken)
 	require.Equal(t, "token-1", d.accounts[1].Token.AccessToken)
-	}
+}
 
 func TestGoogleDrivePrimaryAccountRouting_ListContinuesRotationAfter401RefreshFailure(t *testing.T) {
 	initGoogleDriveTestEnv(t)
