@@ -11,7 +11,6 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
 const (
@@ -29,102 +28,17 @@ func (d *GoogleDrive) AcquireDownloadAuthorization(ctx context.Context, request 
 	if request.File == nil || strings.TrimSpace(request.FileID) == "" {
 		return driver.DownloadAuthorizationResult{}, fmt.Errorf("google_drive: download file identity is empty")
 	}
-	if !d.modeCfg.Enabled {
-		if request.Feedback != nil {
-			d.invalidateSingletonCredential(*request.Feedback)
-		}
-		if singletonDownloadExcluded(request, d.GetStorage().MountPath) {
-			return driver.DownloadAuthorizationResult{}, &driver.DownloadAuthorizationUnavailableError{Reason: "google_drive: singleton account was already tried", RetryAfter: time.Second}
-		}
-		account, err := d.ensureUsableSingletonAccount(ctx)
-		if err != nil {
-			return driver.DownloadAuthorizationResult{}, err
-		}
-		return googleDownloadAuthorizationResult(request, account, AccountHealthLease{}), nil
+	if request.AuthorityProtocol != model.DownloadAuthorityProtocol {
+		return driver.DownloadAuthorizationResult{}, fmt.Errorf("google_drive: authority_protocol must be %d", model.DownloadAuthorityProtocol)
 	}
-
-	d.accountStateMu.Lock()
-	accountCount := len(d.accounts)
-	if d.accountPool == nil {
-		d.accountPool = newAccountPool(d.modeCfg.SelectionPolicy, d.accounts)
-	}
-	pool := d.accountPool
-	d.accountStateMu.Unlock()
-	if accountCount == 0 {
-		return driver.DownloadAuthorizationResult{}, &driver.DownloadAuthorizationUnavailableError{Reason: "google_drive: accounts_json has no usable accounts", RetryAfter: time.Second}
-	}
-	order := pool.nextDownloadAttemptOrder(accountCount)
-	if len(order) == 0 {
-		return driver.DownloadAuthorizationResult{}, &driver.DownloadAuthorizationUnavailableError{Reason: "google_drive: accounts_json has no usable accounts", RetryAfter: time.Second}
-	}
-	excluded := make(map[string]struct{}, len(request.Exclude))
-	for _, item := range request.Exclude {
-		if name := strings.TrimSpace(item.AccountName); name != "" {
-			excluded[name] = struct{}{}
-		}
-	}
-	if request.Feedback != nil {
-		if err := d.reportDownloadFeedback(ctx, *request.Feedback); err != nil {
-			return driver.DownloadAuthorizationResult{}, err
-		}
-	}
-
-	var lastErr error
-	var retryAfter time.Duration
-	for _, index := range order {
-		account, err := d.accountSnapshot(index)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if _, skip := excluded[account.Name]; skip {
-			continue
-		}
-		account, err = d.ensureUsableDownloadAccount(ctx, index, account)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		selection, err := d.acquireDownloadAccount(ctx, request.FileID, index)
-		if err != nil {
-			lastErr = err
-			if unavailable, ok := err.(interface{ RetryAfterDuration() time.Duration }); ok {
-				if wait := unavailable.RetryAfterDuration(); wait > 0 && (retryAfter == 0 || wait < retryAfter) {
-					retryAfter = wait
-				}
-			}
-			continue
-		}
-		return googleDownloadAuthorizationResult(request, selection.account, selection.health), nil
-	}
-
-	if retryAfter > 0 {
-		return driver.DownloadAuthorizationResult{}, &driver.DownloadAuthorizationUnavailableError{Reason: "google_drive: all download accounts are cooling down", RetryAfter: retryAfter}
-	}
-	if lastErr != nil {
-		return driver.DownloadAuthorizationResult{}, &driver.DownloadAuthorizationUnavailableError{Reason: "google_drive: no usable Google Drive download account: " + lastErr.Error(), RetryAfter: time.Second}
-	}
-	return driver.DownloadAuthorizationResult{}, &driver.DownloadAuthorizationUnavailableError{Reason: "google_drive: all requested download accounts were excluded", RetryAfter: time.Second}
+	return d.acquireQuotaAuthorityAuthorization(ctx, request)
 }
 
-func singletonDownloadExcluded(request driver.DownloadAuthorizationRequest, mountPath string) bool {
-	mountPath = utils.FixAndCleanPath(mountPath)
-	for _, exclusion := range request.Exclude {
-		if exclusion.AccountName == "" && utils.FixAndCleanPath(exclusion.MountPath) == mountPath && exclusion.FileID == request.FileID {
-			return true
-		}
-	}
-	return false
-}
-
-func googleDownloadAuthorizationResult(request driver.DownloadAuthorizationRequest, account accountSnapshot, health AccountHealthLease) driver.DownloadAuthorizationResult {
+func googleDownloadAuthorizationResult(request driver.DownloadAuthorizationRequest, account accountSnapshot) driver.DownloadAuthorizationResult {
 	accessToken := account.Token.AccessToken
 	expiresAt := tokenExpiry(account.Token.Expiry)
 	if expiresAt.IsZero() {
 		expiresAt = time.Now().Add(googleDownloadDefaultLifetime)
-	}
-	if !health.ExpiresAt.IsZero() && health.ExpiresAt.Before(expiresAt) {
-		expiresAt = health.ExpiresAt
 	}
 	return driver.DownloadAuthorizationResult{
 		Link: &model.Link{
@@ -136,10 +50,9 @@ func googleDownloadAuthorizationResult(request driver.DownloadAuthorizationReque
 		Provider:             googleDriveAccountProvider,
 		FileID:               request.FileID,
 		AccountName:          account.Name,
-		Generation:           health.Generation,
-		TrialID:              health.TrialID,
+		Generation:           1,
 		CredentialGeneration: account.CredentialGeneration,
-		ReportSuccess:        health.Trial || request.Feedback != nil || len(request.Exclude) > 0,
+		ReportSuccess:        request.Feedback != nil,
 		ExpiresAt:            expiresAt,
 	}
 }
@@ -238,52 +151,11 @@ func tokenExpiry(raw string) time.Time {
 	return time.Unix(seconds, 0)
 }
 
-func (d *GoogleDrive) reportDownloadFeedback(ctx context.Context, feedback driver.DownloadAuthorizationFeedback) error {
-	d.invalidateJSONCredential(feedback)
-	d.invalidateSingletonCredential(feedback)
-	if d.accountHealth == nil || feedback.AccountName == "" {
-		return nil
-	}
-	_, err := d.accountHealth.report(ctx, AccountHealthReportInput{
-		AccountName: feedback.AccountName,
-		FileID:      feedback.FileID,
-		EventID:     feedback.EventID,
-		Outcome:     AccountHealthOutcome(feedback.Outcome),
-		StatusCode:  feedback.StatusCode,
-		Reason:      feedback.Reason,
-		Generation:  feedback.Generation,
-		TrialID:     feedback.TrialID,
-	})
-	return err
-}
-
 func (d *GoogleDrive) ReportDownloadAuthorization(ctx context.Context, report driver.DownloadAuthorizationReport) (driver.DownloadAuthorizationReportResult, error) {
-	d.invalidateJSONCredential(report)
-	d.invalidateSingletonCredential(report)
-	if d.accountHealth == nil || report.AccountName == "" {
-		return driver.DownloadAuthorizationReportResult{Applied: true}, nil
+	if report.AuthorityProtocol != model.DownloadAuthorityProtocol {
+		return driver.DownloadAuthorizationReportResult{}, fmt.Errorf("google_drive: authority_protocol must be %d", model.DownloadAuthorityProtocol)
 	}
-	result, err := d.accountHealth.report(ctx, AccountHealthReportInput{
-		AccountName: report.AccountName,
-		FileID:      report.FileID,
-		EventID:     report.EventID,
-		Outcome:     AccountHealthOutcome(report.Outcome),
-		StatusCode:  report.StatusCode,
-		Reason:      report.Reason,
-		Generation:  report.Generation,
-		TrialID:     report.TrialID,
-	})
-	if err != nil {
-		return driver.DownloadAuthorizationReportResult{}, err
-	}
-	return driver.DownloadAuthorizationReportResult{
-		Applied:       result.Applied,
-		Duplicate:     result.Duplicate,
-		Stale:         result.Stale,
-		Generation:    result.Generation,
-		CooldownUntil: result.CooldownUntil,
-		RetryAfter:    result.RetryAfter,
-	}, nil
+	return d.reportQuotaAuthority(ctx, report)
 }
 
 var _ driver.DownloadAuthorizer = (*GoogleDrive)(nil)

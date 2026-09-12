@@ -227,10 +227,9 @@ func TestAccountStore_RejectsOnDiskIdentityReorderWithoutOverwriting(t *testing.
 	}, path, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.shutdown(context.Background()) })
-	store.setToken(0, `{"access_token":"updated"}`)
-
 	reordered := `[{"name":"second","token":{"access_token":"external-2"}},{"name":"first","token":{"access_token":"external-1"}}]`
 	require.NoError(t, os.WriteFile(path, []byte(reordered), 0o600))
+	store.setToken(0, `{"access_token":"updated"}`)
 	err = store.flush(context.Background())
 	require.ErrorIs(t, err, errAccountStoreIdentityMismatch)
 	content, readErr := os.ReadFile(path)
@@ -246,10 +245,9 @@ func TestAccountStore_RejectsOnDiskIdentityRenameWithoutOverwriting(t *testing.T
 	}, path, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.shutdown(context.Background()) })
-	store.setToken(0, `{"access_token":"updated"}`)
-
 	renamed := `[{"name":"renamed","token":{"access_token":"external-1"}},{"name":"second","token":{"access_token":"external-2"}}]`
 	require.NoError(t, os.WriteFile(path, []byte(renamed), 0o600))
+	store.setToken(0, `{"access_token":"updated"}`)
 	err = store.flush(context.Background())
 	require.ErrorIs(t, err, errAccountStoreIdentityMismatch)
 	content, readErr := os.ReadFile(path)
@@ -266,10 +264,9 @@ func TestAccountStore_RejectsSameNameCredentialChangesWithoutOverwriting(t *test
 	}, path, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.shutdown(context.Background()) })
-	store.setToken(0, `{"access_token":"updated"}`)
-
 	swapped := `[{"name":"same","token":{"access_token":"second"}},{"name":"same","token":{"access_token":"first"}}]`
 	require.NoError(t, os.WriteFile(path, []byte(swapped), 0o600))
+	store.setToken(0, `{"access_token":"updated"}`)
 	err = store.flush(context.Background())
 	require.ErrorIs(t, err, errAccountStoreIdentityMismatch)
 	content, readErr := os.ReadFile(path)
@@ -284,9 +281,9 @@ func TestAccountStore_RejectsSameNameCredentialChangesWithoutOverwriting(t *test
 	}, path, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.shutdown(context.Background()) })
-	store.setToken(0, `{"access_token":"updated"}`)
 	altered := `[{"name":"same","token":{"access_token":"external"}},{"name":"same","token":{"access_token":"second"}}]`
 	require.NoError(t, os.WriteFile(path, []byte(altered), 0o600))
+	store.setToken(0, `{"access_token":"updated"}`)
 	err = store.flush(context.Background())
 	require.ErrorIs(t, err, errAccountStoreIdentityMismatch)
 	content, readErr = os.ReadFile(path)
@@ -299,9 +296,9 @@ func TestAccountStore_AcceptsHarmlessJSONRepresentationChanges(t *testing.T) {
 	store, err := newAccountStore([]accountConfig{{Index: 0, Name: "same", TokenJSON: `{"access_token":"seed","refresh_token":"refresh"}`}}, path, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.shutdown(context.Background()) })
-	store.setToken(0, `{"access_token":"updated","refresh_token":"refresh"}`)
 	representation := "[ {\"token\": { \"access_token\": \"seed\", \"refresh_token\": \"refresh\" }, \"name\": \"same\" } ]"
 	require.NoError(t, os.WriteFile(path, []byte(representation), 0o600))
+	store.setToken(0, `{"access_token":"updated","refresh_token":"refresh"}`)
 	require.NoError(t, store.flush(context.Background()))
 	entries := readPersistedAccountsFile(t, path)
 	require.Len(t, entries, 1)

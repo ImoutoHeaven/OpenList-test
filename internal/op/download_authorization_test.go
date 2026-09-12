@@ -2,7 +2,10 @@ package op_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	stdpath "path"
 	"strings"
@@ -20,6 +23,34 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
+func downloadTicketHashForTest(ticket string) string {
+	digest := sha256.Sum256([]byte(ticket))
+	return hex.EncodeToString(digest[:])
+}
+
+func resignDownloadReference(t *testing.T, reference string, field string, value any, expiresAt int64) string {
+	t.Helper()
+	parts := strings.Split(reference, ".")
+	if len(parts) != 2 {
+		t.Fatalf("invalid signed reference: %q", reference)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		t.Fatalf("decode signed reference: %v", err)
+	}
+	claims := make(map[string]any)
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatalf("decode signed reference claims: %v", err)
+	}
+	claims[field] = value
+	payload, err = json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("encode signed reference claims: %v", err)
+	}
+	signer := pkgsign.NewHMACSign([]byte(mustGetSettingItem(t, "token").Value))
+	return base64.RawURLEncoding.EncodeToString(payload) + "." + signer.Sign(string(payload), expiresAt)
+}
+
 func TestResolveLinkAPIRejectsTamperedExpiredAndCrossFileReportsBeforeDriverMutation(t *testing.T) {
 	mountPath := uniqueMountPath(t, "authorization-boundary")
 	driver := mustCreateAuthorizationTestStorage(t, mountPath, authorizationTestBehavior{
@@ -30,7 +61,7 @@ func TestResolveLinkAPIRejectsTamperedExpiredAndCrossFileReportsBeforeDriverMuta
 	})
 	seedLinkAPISigningToken(t)
 	path := mountPath + "/file.bin"
-	link, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{Action: "acquire", Path: path})
+	link, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{AuthorityProtocol: model.DownloadAuthorityProtocol, Action: "acquire", Path: path})
 	if err != nil {
 		t.Fatalf("acquire failed: %v", err)
 	}
@@ -39,14 +70,19 @@ func TestResolveLinkAPIRejectsTamperedExpiredAndCrossFileReportsBeforeDriverMuta
 
 	report := func(path, ticket, eventID string) error {
 		_, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{
-			Action: "report",
-			Path:   path,
+			AuthorityProtocol: model.DownloadAuthorityProtocol,
+			Action:            "report",
+			Path:              path,
 			Feedback: &model.DownloadFeedback{
-				Ticket:     ticket,
-				EventID:    eventID,
-				Outcome:    "failure",
-				StatusCode: http.StatusInternalServerError,
-				Reason:     "upstream failed",
+				AuthorityProtocol: model.DownloadAuthorityProtocol,
+				Ticket:            ticket,
+				Permit:            link.Download.Permit,
+				ObservationID:     link.Download.Permit.ObservationID,
+				EventType:         "failure",
+				EventID:           eventID,
+				Outcome:           "failure",
+				StatusCode:        http.StatusInternalServerError,
+				Reason:            "upstream failed",
 			},
 		})
 		return err
@@ -79,13 +115,18 @@ func TestResolveLinkAPIRejectsTamperedExpiredAndCrossFileReportsBeforeDriverMuta
 		t.Fatalf("expected cross-file ticket request error, got %v", err)
 	}
 	_, _, err = op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{
-		Action: "report",
-		Path:   path,
+		AuthorityProtocol: model.DownloadAuthorityProtocol,
+		Action:            "report",
+		Path:              path,
 		Feedback: &model.DownloadFeedback{
-			Ticket:     ticket,
-			EventID:    "invalid-success-status",
-			Outcome:    "success",
-			StatusCode: http.StatusInternalServerError,
+			AuthorityProtocol: model.DownloadAuthorityProtocol,
+			Ticket:            ticket,
+			Permit:            link.Download.Permit,
+			ObservationID:     link.Download.Permit.ObservationID,
+			EventType:         "success",
+			EventID:           "invalid-success-status",
+			Outcome:           "success",
+			StatusCode:        http.StatusInternalServerError,
 		},
 	})
 	if err == nil || !op.IsLinkAPIRequestError(err) {
@@ -94,6 +135,89 @@ func TestResolveLinkAPIRejectsTamperedExpiredAndCrossFileReportsBeforeDriverMuta
 	if got := driver.reportCalls.Load(); got != 0 {
 		t.Fatalf("expected invalid reports to avoid driver mutation, got %d reports", got)
 	}
+	_, _, err = op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{
+		AuthorityProtocol: model.DownloadAuthorityProtocol,
+		Action:            "report",
+		Path:              path,
+		Feedback: &model.DownloadFeedback{
+			AuthorityProtocol: model.DownloadAuthorityProtocol,
+			Ticket:            ticket,
+			Permit:            link.Download.Permit,
+			ObservationID:     link.Download.Permit.ObservationID,
+			EventType:         "success",
+			Outcome:           "failure",
+			StatusCode:        http.StatusForbidden,
+			Reason:            "quota",
+		},
+	})
+	if err == nil || !op.IsLinkAPIRequestError(err) {
+		t.Fatalf("expected inconsistent success event/outcome request error, got %v", err)
+	}
+	if got := driver.reportCalls.Load(); got != 0 {
+		t.Fatalf("expected semantically invalid report to avoid driver mutation, got %d reports", got)
+	}
+}
+
+func TestResolveLinkAPILateQuotaCanSelectReplacementDuringReportGrace(t *testing.T) {
+	mountPath := uniqueMountPath(t, "authorization-late-quota")
+	driver := mustCreateAuthorizationTestStorage(t, mountPath, authorizationTestBehavior{
+		files: map[string]authorizationTestFile{"/file.bin": {id: "file-id", size: 7}},
+	})
+	seedLinkAPISigningToken(t)
+	path := mountPath + "/file.bin"
+	initial, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{
+		AuthorityProtocol: model.DownloadAuthorityProtocol,
+		Action:            "acquire",
+		Path:              path,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire failed: %v", err)
+	}
+	defer initial.Close()
+	expiredAt := time.Now().Add(-time.Minute).Unix()
+	expiredTicket := resignDownloadReference(t, initial.Download.Ticket, "expires_at", expiredAt, expiredAt)
+	permitClaimsTicket := expiredTicket
+	expiredPermitProof := resignDownloadReference(t, initial.Download.Permit.Proof, "expires_at", expiredAt, expiredAt)
+	expiredPermitProof = resignDownloadReference(t, expiredPermitProof, "issued_at", expiredAt-60, expiredAt)
+	expiredPermitProof = resignDownloadReference(t, expiredPermitProof, "ticket_hash", downloadTicketHashForTest(permitClaimsTicket), expiredAt)
+	expiredPermit := *initial.Download.Permit
+	expiredPermit.Proof = expiredPermitProof
+
+	replacement, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{
+		AuthorityProtocol: model.DownloadAuthorityProtocol,
+		Action:            "next_plan",
+		Path:              path,
+		Feedback: &model.DownloadFeedback{
+			AuthorityProtocol: model.DownloadAuthorityProtocol,
+			Ticket:            expiredTicket,
+			Permit:            &expiredPermit,
+			ObservationID:     initial.Download.Permit.ObservationID,
+			EventType:         "quota",
+			Outcome:           "failure",
+			StatusCode:        http.StatusForbidden,
+			Reason:            "quota",
+		},
+	})
+	if err != nil {
+		t.Fatalf("late quota replacement failed: %v", err)
+	}
+	if replacement == nil || replacement.Download == nil || replacement.Download.Ticket == expiredTicket {
+		t.Fatal("expected a fresh replacement authorization during report grace")
+	}
+	if got := driver.acquireCalls.Load(); got != 2 {
+		t.Fatalf("expected one initial and one replacement acquisition, got %d", got)
+	}
+
+	_, _, err = op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{
+		AuthorityProtocol: model.DownloadAuthorityProtocol,
+		Action:            "next_plan",
+		Path:              path,
+		Ticket:            expiredTicket,
+	})
+	if err == nil || !op.IsLinkAPIRequestError(err) {
+		t.Fatalf("expected expired ticket-only next_plan rejection, got %v", err)
+	}
+	_ = replacement.Close()
 }
 
 func TestResolveLinkAPIValidFeedbackAndInvalidExclusionDoNotMutateDriver(t *testing.T) {
@@ -103,32 +227,38 @@ func TestResolveLinkAPIValidFeedbackAndInvalidExclusionDoNotMutateDriver(t *test
 	})
 	seedLinkAPISigningToken(t)
 	path := mountPath + "/file.bin"
-	initial, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{Action: "acquire", Path: path})
+	initial, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{AuthorityProtocol: model.DownloadAuthorityProtocol, Action: "acquire", Path: path})
 	if err != nil {
 		t.Fatalf("initial acquire failed: %v", err)
 	}
 	_ = initial.Close()
+	tamperedPermit := *initial.Download.Permit
+	tamperedPermit.Proof += "-tampered"
 
 	_, _, err = op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{
-		Action: "acquire",
-		Path:   path,
+		AuthorityProtocol: model.DownloadAuthorityProtocol,
+		Action:            "acquire",
+		Path:              path,
 		Feedback: &model.DownloadFeedback{
-			Ticket:     initial.Download.Ticket,
-			EventID:    "valid-feedback",
-			Outcome:    "failure",
-			StatusCode: http.StatusForbidden,
-			Reason:     "downloadQuotaExceeded",
+			AuthorityProtocol: model.DownloadAuthorityProtocol,
+			Ticket:            initial.Download.Ticket,
+			Permit:            &tamperedPermit,
+			ObservationID:     initial.Download.Permit.ObservationID,
+			EventType:         "failure",
+			EventID:           "valid-feedback",
+			Outcome:           "failure",
+			StatusCode:        http.StatusForbidden,
+			Reason:            "downloadQuotaExceeded",
 		},
-		Exclude: []string{initial.Download.Ticket + "-tampered"},
 	})
 	if err == nil || !op.IsLinkAPIRequestError(err) {
-		t.Fatalf("expected invalid exclusion request error, got %v", err)
+		t.Fatalf("expected invalid permit request error, got %v", err)
 	}
 	if got := driver.acquireCalls.Load(); got != 1 {
-		t.Fatalf("expected invalid exclusion to stop before replacement acquire, got %d acquires", got)
+		t.Fatalf("expected invalid permit to stop before replacement acquire, got %d acquires", got)
 	}
 	if got := driver.reportCalls.Load(); got != 0 {
-		t.Fatalf("expected valid feedback to remain unapplied when exclusion is invalid, got %d reports", got)
+		t.Fatalf("expected valid feedback to remain unapplied when permit is invalid, got %d reports", got)
 	}
 }
 
@@ -148,7 +278,7 @@ func TestResolveLinkAPIAliasFeedbackRetainsSignedLeaf(t *testing.T) {
 	})
 	seedLinkAPISigningToken(t)
 	requestedPath := aliasMount + "/file.bin"
-	link, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{Action: "acquire", Path: requestedPath})
+	link, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{AuthorityProtocol: model.DownloadAuthorityProtocol, Action: "acquire", Path: requestedPath})
 	if err != nil {
 		t.Fatalf("alias acquire failed: %v", err)
 	}
@@ -158,14 +288,19 @@ func TestResolveLinkAPIAliasFeedbackRetainsSignedLeaf(t *testing.T) {
 	ticket := link.Download.Ticket
 	_ = link.Close()
 	_, result, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{
-		Action: "report",
-		Path:   requestedPath,
+		AuthorityProtocol: model.DownloadAuthorityProtocol,
+		Action:            "report",
+		Path:              requestedPath,
 		Feedback: &model.DownloadFeedback{
-			Ticket:     ticket,
-			EventID:    "alias-report",
-			Outcome:    "failure",
-			StatusCode: http.StatusInternalServerError,
-			Reason:     "content failed",
+			AuthorityProtocol: model.DownloadAuthorityProtocol,
+			Ticket:            ticket,
+			Permit:            link.Download.Permit,
+			ObservationID:     link.Download.Permit.ObservationID,
+			EventType:         "failure",
+			EventID:           "",
+			Outcome:           "failure",
+			StatusCode:        http.StatusInternalServerError,
+			Reason:            "content failed",
 		},
 	})
 	if err != nil {
@@ -176,6 +311,52 @@ func TestResolveLinkAPIAliasFeedbackRetainsSignedLeaf(t *testing.T) {
 	}
 	if got := leaf.reportCalls.Load(); got != 1 {
 		t.Fatalf("expected report on signed concrete leaf, got %d reports", got)
+	}
+}
+
+func TestResolveLinkAPINextPlanTicketRetainsSignedLeaf(t *testing.T) {
+	leafMount := uniqueMountPath(t, "next-plan-leaf")
+	leaf := mustCreateAuthorizationTestStorage(t, leafMount, authorizationTestBehavior{
+		files: map[string]authorizationTestFile{"/file.bin": {id: "next-plan-file-id", size: 7}},
+	})
+	aliasMount := uniqueMountPath(t, "next-plan-alias")
+	mustCreateStorage(t, model.Storage{
+		MountPath: aliasMount,
+		Driver:    "Alias",
+		Addition: mustMarshal(t, alias.Addition{
+			Paths:           leafMount,
+			ProtectSameName: true,
+		}),
+	})
+	seedLinkAPISigningToken(t)
+	requestedPath := aliasMount + "/file.bin"
+	initial, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{
+		AuthorityProtocol: model.DownloadAuthorityProtocol,
+		Action:            "acquire",
+		Path:              requestedPath,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire failed: %v", err)
+	}
+	defer initial.Close()
+	initialRequest := leaf.lastAcquireRequest()
+
+	next, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{
+		AuthorityProtocol: model.DownloadAuthorityProtocol,
+		Action:            "next_plan",
+		Path:              requestedPath,
+		Ticket:            initial.Download.Ticket,
+	})
+	if err != nil {
+		t.Fatalf("ticket-only next_plan failed: %v", err)
+	}
+	defer next.Close()
+	nextRequest := leaf.lastAcquireRequest()
+	if nextRequest.Operation != "next_plan" || nextRequest.Ticket != initial.Download.Ticket {
+		t.Fatalf("expected next_plan to retain the original signed ticket, got %+v", nextRequest)
+	}
+	if nextRequest.MountPath != initialRequest.MountPath || nextRequest.LeafPath != initialRequest.LeafPath || nextRequest.FileID != initialRequest.FileID {
+		t.Fatalf("ticket-only next_plan changed the signed physical leaf: initial=%+v next=%+v", initialRequest, nextRequest)
 	}
 }
 
@@ -195,15 +376,15 @@ func TestResolveLinkAPICanceledIssuanceReleasesTrialWithDetachedContext(t *testi
 	seedLinkAPISigningToken(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err := op.ResolveLinkAPI(ctx, op.LinkAPIRequest{Action: "acquire", Path: mountPath + "/file.bin"})
+	_, _, err := op.ResolveLinkAPI(ctx, op.LinkAPIRequest{AuthorityProtocol: model.DownloadAuthorityProtocol, Action: "acquire", Path: mountPath + "/file.bin"})
 	if err == nil {
 		t.Fatal("expected canceled issuance to fail")
 	}
-	if got := driver.reportCalls.Load(); got != 1 {
-		t.Fatalf("expected canceled issuance to release the trial, got %d reports", got)
+	if got := driver.permissionCalls.Load(); got != 1 {
+		t.Fatalf("expected canceled issuance to release the trial, got %d permission releases", got)
 	}
-	if driver.lastReportContextErr() != nil {
-		t.Fatalf("expected detached release context, got %v", driver.lastReportContextErr())
+	if driver.lastPermissionContextErr() != nil {
+		t.Fatalf("expected detached release context, got %v", driver.lastPermissionContextErr())
 	}
 }
 
@@ -221,12 +402,12 @@ func TestResolveLinkAPIIssuanceFailureReleasesTrial(t *testing.T) {
 		},
 	})
 	seedLinkAPISigningToken(t)
-	_, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{Action: "acquire", Path: mountPath + "/file.bin"})
+	_, _, err := op.ResolveLinkAPI(context.Background(), op.LinkAPIRequest{AuthorityProtocol: model.DownloadAuthorityProtocol, Action: "acquire", Path: mountPath + "/file.bin"})
 	if err == nil {
 		t.Fatal("expected invalid authorization URL to fail")
 	}
-	if got := driver.reportCalls.Load(); got != 1 {
-		t.Fatalf("expected failed issuance to release the trial, got %d reports", got)
+	if got := driver.permissionCalls.Load(); got != 1 {
+		t.Fatalf("expected failed issuance to release the trial, got %d permission releases", got)
 	}
 }
 
@@ -242,6 +423,7 @@ var authorizationTestFixtures = struct {
 type authorizationTestBehavior struct {
 	files   map[string]authorizationTestFile
 	acquire func(driverpkg.DownloadAuthorizationRequest) driverpkg.DownloadAuthorizationResult
+	check   func(context.Context, driverpkg.DownloadPermissionRequest) driverpkg.DownloadPermissionResult
 }
 
 type authorizationTestFile struct {
@@ -280,11 +462,13 @@ type authorizationTestDriver struct {
 	files    map[string]*model.Object
 	behavior authorizationTestBehavior
 
-	acquireCalls     atomic.Int32
-	reportCalls      atomic.Int32
-	mu               sync.Mutex
-	lastAcquire      driverpkg.DownloadAuthorizationRequest
-	reportContextErr error
+	acquireCalls         atomic.Int32
+	reportCalls          atomic.Int32
+	permissionCalls      atomic.Int32
+	mu                   sync.Mutex
+	lastAcquire          driverpkg.DownloadAuthorizationRequest
+	reportContextErr     error
+	permissionContextErr error
 }
 
 func (d *authorizationTestDriver) Config() driverpkg.Config {
@@ -338,16 +522,48 @@ func (d *authorizationTestDriver) ReportDownloadAuthorization(ctx context.Contex
 	return driverpkg.DownloadAuthorizationReportResult{Applied: true}, nil
 }
 
+func (d *authorizationTestDriver) CheckDownloadPermission(ctx context.Context, request driverpkg.DownloadPermissionRequest) (driverpkg.DownloadPermissionResult, error) {
+	d.permissionCalls.Add(1)
+	d.mu.Lock()
+	d.permissionContextErr = ctx.Err()
+	d.mu.Unlock()
+	if d.behavior.check != nil {
+		return d.behavior.check(ctx, request), nil
+	}
+	return driverpkg.DownloadPermissionResult{
+		AuthorityProtocol: model.DownloadAuthorityProtocol,
+		Allow:             true,
+		AccountName:       request.AccountName,
+		FileGeneration:    request.FileGeneration,
+		AccountGeneration: request.Generation,
+		Mode:              request.Mode,
+		ObservationID:     request.ObservationID,
+		ReservationID:     request.ReservationID,
+	}, nil
+}
+
 func (d *authorizationTestDriver) lastAcquireMount() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.lastAcquire.MountPath
 }
 
+func (d *authorizationTestDriver) lastAcquireRequest() driverpkg.DownloadAuthorizationRequest {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.lastAcquire
+}
+
 func (d *authorizationTestDriver) lastReportContextErr() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.reportContextErr
+}
+
+func (d *authorizationTestDriver) lastPermissionContextErr() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.permissionContextErr
 }
 
 func seedLinkAPISigningToken(t *testing.T) {
@@ -368,3 +584,4 @@ func seedLinkAPISigningToken(t *testing.T) {
 var _ driverpkg.Driver = (*authorizationTestDriver)(nil)
 var _ driverpkg.Getter = (*authorizationTestDriver)(nil)
 var _ driverpkg.DownloadAuthorizer = (*authorizationTestDriver)(nil)
+var _ driverpkg.DownloadPermissionAuthorizer = (*authorizationTestDriver)(nil)

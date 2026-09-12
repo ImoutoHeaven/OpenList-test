@@ -26,7 +26,6 @@ type GoogleDrive struct {
 	modeCfg                           downloadModeConfig
 	accounts                          []accountRuntime
 	accountPool                       *accountPool
-	accountHealth                     *accountHealthRuntime
 	accountStore                      accountStore
 	accountStateMu                    sync.RWMutex
 	accountRefreshSlots               []*sync.Mutex

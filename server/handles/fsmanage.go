@@ -22,11 +22,15 @@ import (
 )
 
 type MkdirOrLinkReq struct {
-	Action   string                  `json:"action" form:"action"`
-	Path     string                  `json:"path" form:"path"`
-	Refresh  bool                    `json:"refresh" form:"refresh"`
-	Feedback *model.DownloadFeedback `json:"feedback" form:"feedback"`
-	Exclude  []string                `json:"exclude" form:"exclude"`
+	AuthorityProtocol int                                `json:"authority_protocol" form:"authority_protocol"`
+	Action            string                             `json:"action" form:"action"`
+	Path              string                             `json:"path" form:"path"`
+	Refresh           bool                               `json:"refresh" form:"refresh"`
+	Feedback          *model.DownloadFeedback            `json:"feedback" form:"feedback"`
+	Ticket            string                             `json:"ticket" form:"ticket"`
+	Permit            *model.DownloadExecutionPermission `json:"permit" form:"permit"`
+	Operation         string                             `json:"operation" form:"operation"`
+	ExecutionClaimID  string                             `json:"execution_claim_id" form:"execution_claim_id"`
 }
 
 func FsMkdir(c *gin.Context) {
@@ -390,11 +394,19 @@ func Link(c *gin.Context) {
 	if q := c.Query("refresh"); q != "" {
 		refresh = strings.EqualFold(q, "true") || q == "1"
 	}
+	if req.AuthorityProtocol != model.DownloadAuthorityProtocol {
+		common.ErrorStrResp(c, fmt.Sprintf("authority_protocol must be %d", model.DownloadAuthorityProtocol), http.StatusBadRequest)
+		return
+	}
 	link, report, err := op.ResolveLinkAPI(c.Request.Context(), op.LinkAPIRequest{
-		Action:   req.Action,
-		Path:     rawPath,
-		Feedback: req.Feedback,
-		Exclude:  req.Exclude,
+		AuthorityProtocol: req.AuthorityProtocol,
+		Action:            req.Action,
+		Path:              rawPath,
+		Feedback:          req.Feedback,
+		Ticket:            req.Ticket,
+		Permit:            req.Permit,
+		Operation:         req.Operation,
+		ExecutionClaimID:  req.ExecutionClaimID,
 		Args: model.LinkArgs{
 			IP:           c.ClientIP(),
 			Header:       c.Request.Header,
@@ -416,12 +428,14 @@ func Link(c *gin.Context) {
 
 func linkAPIReportData(result driver.DownloadAuthorizationReportResult) gin.H {
 	data := gin.H{
-		"applied":        result.Applied,
-		"duplicate":      result.Duplicate,
-		"stale":          result.Stale,
-		"generation":     result.Generation,
-		"cooldown_until": int64(0),
-		"retry_after":    int64(0),
+		"authority_protocol": model.DownloadAuthorityProtocol,
+		"applied":            result.Applied,
+		"duplicate":          result.Duplicate,
+		"stale":              result.Stale,
+		"generation":         result.Generation,
+		"cooldown_until":     int64(0),
+		"retry_after":        int64(0),
+		"reason":             result.Reason,
 	}
 	if !result.CooldownUntil.IsZero() {
 		data["cooldown_until"] = result.CooldownUntil.Unix()
@@ -433,6 +447,19 @@ func linkAPIReportData(result driver.DownloadAuthorizationReportResult) gin.H {
 }
 
 func linkAPIErrorResp(c *gin.Context, err error) {
+	if op.IsLinkAPIConflictError(err) {
+		c.JSON(http.StatusConflict, common.Resp[gin.H]{
+			Code:    http.StatusConflict,
+			Message: err.Error(),
+			Data: gin.H{
+				"authority_protocol": model.DownloadAuthorityProtocol,
+				"conflict":           true,
+				"retryable":          false,
+			},
+		})
+		c.Abort()
+		return
+	}
 	code := 500
 	if op.IsLinkAPIRequestError(err) {
 		code = http.StatusBadRequest

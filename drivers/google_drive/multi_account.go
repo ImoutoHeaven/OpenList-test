@@ -3,11 +3,9 @@ package google_drive
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,7 +14,6 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
-	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"golang.org/x/oauth2"
 )
 
@@ -421,15 +418,6 @@ func (d *GoogleDrive) initAccountsJSONMode(ctx context.Context) error {
 		return err
 	}
 	d.accountStore = store
-	if db.GetDb() != nil {
-		d.accountHealth = sharedAccountHealth
-		for _, account := range d.accounts {
-			if _, err := d.accountHealth.getWithContext(ctx, account.Name); err != nil {
-				_ = d.accountStore.shutdown(context.Background())
-				return err
-			}
-		}
-	}
 	d.accountPool = newAccountPool(d.modeCfg.SelectionPolicy, d.accounts)
 	return d.syncPrimaryAccessToken()
 }
@@ -716,39 +704,6 @@ func isRetryableDownloadStatus(statusCode int, body []byte) bool {
 	return false
 }
 
-type downloadAccountSelection struct {
-	account accountSnapshot
-	health  AccountHealthLease
-}
-
-func (d *GoogleDrive) acquireDownloadAccount(ctx context.Context, fileID string, index int) (downloadAccountSelection, error) {
-	account, err := d.accountSnapshot(index)
-	if err != nil {
-		return downloadAccountSelection{}, err
-	}
-	selection := downloadAccountSelection{account: account}
-	if d.accountHealth != nil {
-		selection.health, err = d.accountHealth.acquire(ctx, account.Name, fileID)
-		if err != nil {
-			return downloadAccountSelection{}, err
-		}
-	}
-	return selection, nil
-}
-
-func googleDriveFileIDFromRequestURL(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
-	if err == nil {
-		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-		for i := 0; i+1 < len(parts); i++ {
-			if parts[i] == "files" && parts[i+1] != "" {
-				return parts[i+1]
-			}
-		}
-	}
-	return strings.TrimSpace(rawURL)
-}
-
 func (d *GoogleDrive) requestDownloadWithRotation(ctx context.Context, url string, method string, callback base.ReqCallback, resp interface{}) (winningToken string, body []byte, err error) {
 	d.accountStateMu.RLock()
 	accountCount := len(d.accounts)
@@ -764,24 +719,16 @@ func (d *GoogleDrive) requestDownloadWithRotation(ctx context.Context, url strin
 	}
 
 	failures := make([]string, 0, len(order))
-	var lastUnavailable error
 	attempts := 0
-	fileID := googleDriveFileIDFromRequestURL(url)
 	for _, index := range order {
 		if attempts >= attemptBudget {
 			break
 		}
-		selection, err := d.acquireDownloadAccount(ctx, fileID, index)
+		attempts++
+		account, err := d.accountSnapshot(index)
 		if err != nil {
-			var unavailable *AccountHealthUnavailableError
-			if errors.As(err, &unavailable) {
-				lastUnavailable = err
-				continue
-			}
 			return "", nil, err
 		}
-		attempts++
-		account := selection.account
 		body, statusCode, reqErr := executeRequestWithToken(ctx, account.Token.AccessToken, url, method, callback, resp)
 		if reqErr != nil {
 			return "", nil, reqErr
@@ -814,10 +761,6 @@ func (d *GoogleDrive) requestDownloadWithRotation(ctx context.Context, url strin
 		}
 		failures = append(failures, failure)
 	}
-	if attempts == 0 && lastUnavailable != nil {
-		return "", nil, lastUnavailable
-	}
-
 	return "", nil, fmt.Errorf("google_drive: download rotation exhausted: %s", strings.Join(failures, "; "))
 }
 

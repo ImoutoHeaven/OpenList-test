@@ -49,7 +49,7 @@ func (d *GoogleDrive) refreshTokenWithContext(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := lockAccountHealthMutex(ctx, &d.singleRefreshMu); err != nil {
+	if err := lockContextMutex(ctx, &d.singleRefreshMu); err != nil {
 		return err
 	}
 	defer d.singleRefreshMu.Unlock()
@@ -66,7 +66,7 @@ func (d *GoogleDrive) refreshTokenIfNeededWithContext(ctx context.Context) error
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := lockAccountHealthMutex(ctx, &d.singleRefreshMu); err != nil {
+	if err := lockContextMutex(ctx, &d.singleRefreshMu); err != nil {
 		return err
 	}
 	defer d.singleRefreshMu.Unlock()

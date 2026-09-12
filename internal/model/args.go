@@ -43,23 +43,49 @@ type Link struct {
 	utils.SyncClosers `json:"-"`
 }
 
+const DownloadAuthorityProtocol = 2
+
 // DownloadAuthorization is the signed server-side authorization accompanying
-// a link returned by the administrator download API.
+// a link returned by the administrator download API. The permit is deliberately
+// separate from the long-lived transport authorization.
 type DownloadAuthorization struct {
-	Provider      string `json:"provider"`
-	Ticket        string `json:"ticket"`
-	ExpiresAt     int64  `json:"expires_at"`
-	ReportSuccess bool   `json:"report_success"`
+	AuthorityProtocol   int64                        `json:"authority_protocol"`
+	Provider            string                       `json:"provider"`
+	Ticket              string                       `json:"ticket"`
+	ExpiresAt           int64                        `json:"expires_at"`
+	CredentialExpiresAt int64                        `json:"credential_expires_at,omitempty"`
+	ReportSuccess       bool                         `json:"report_success"`
+	Permit              *DownloadExecutionPermission `json:"permit"`
+}
+
+// DownloadExecutionPermission is an opaque, short-lived permission to open
+// the transport URL. Workers store proof and never interpret its claims.
+type DownloadExecutionPermission struct {
+	AuthorityProtocol int64  `json:"authority_protocol"`
+	Proof             string `json:"proof"`
+	ValidForMS        int64  `json:"valid_for_ms"`
+	Mode              string `json:"mode"`
+	ObservationID     string `json:"observation_id"`
+	ReportSuccess     bool   `json:"report_success"`
+	Allow             bool   `json:"allow"`
+	Reason            string `json:"reason,omitempty"`
+	RetryAfterMS      int64  `json:"retry_after_ms,omitempty"`
+	ReservationID     string `json:"reservation_id,omitempty"`
+	ExecutionClaimID  string `json:"execution_claim_id,omitempty"`
 }
 
 // DownloadFeedback is the terminal content result sent with a replacement
 // acquisition or a report-only link request.
 type DownloadFeedback struct {
-	Ticket     string `json:"ticket"`
-	EventID    string `json:"event_id"`
-	Outcome    string `json:"outcome"`
-	StatusCode int    `json:"status_code"`
-	Reason     string `json:"reason"`
+	AuthorityProtocol int64                        `json:"authority_protocol"`
+	Ticket            string                       `json:"ticket"`
+	Permit            *DownloadExecutionPermission `json:"permit"`
+	ObservationID     string                       `json:"observation_id"`
+	EventType         string                       `json:"event_type"`
+	EventID           string                       `json:"event_id,omitempty"`
+	Outcome           string                       `json:"outcome"`
+	StatusCode        int                          `json:"status_code"`
+	Reason            string                       `json:"reason"`
 }
 
 type OtherArgs struct {

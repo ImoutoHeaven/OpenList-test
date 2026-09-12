@@ -56,7 +56,7 @@ func TestLinkHandler_ReturnsLeafDirectURLWithoutPProxyFallback(t *testing.T) {
 
 	recorder := callLinkHandler(t, linkHandlerRequest{
 		path:       storage.MountPath + "/file.bin",
-		bodyJSON:   `{"action":"acquire","path":"` + storage.MountPath + `/file.bin","refresh":false}`,
+		bodyJSON:   `{"authority_protocol":2,"action":"acquire","path":"` + storage.MountPath + `/file.bin","refresh":false}`,
 		rawQuery:   "type=download&refresh=1",
 		remoteAddr: "203.0.113.9:3456",
 		headers: http.Header{
@@ -168,7 +168,7 @@ func TestLinkHandler_ReturnsJSONErrorWhenLeafHasNoExternalURLAndNoDownProxyURL(t
 
 	recorder := callLinkHandler(t, linkHandlerRequest{
 		path:       storage.MountPath + "/stream-only.bin",
-		bodyJSON:   `{"action":"acquire","path":"` + storage.MountPath + `/stream-only.bin","refresh":true}`,
+		bodyJSON:   `{"authority_protocol":2,"action":"acquire","path":"` + storage.MountPath + `/stream-only.bin","refresh":true}`,
 		remoteAddr: "198.51.100.44:9876",
 		headers: http.Header{
 			"Content-Type": []string{"application/json"},
@@ -204,7 +204,7 @@ func TestLinkHandler_ReportOnlyAcceptsSignedGenericTicketWithoutReplacement(t *t
 	path := storage.MountPath + "/file.bin"
 	acquire := callLinkHandler(t, linkHandlerRequest{
 		path:     path,
-		bodyJSON: `{"action":"acquire","path":"` + path + `"}`,
+		bodyJSON: `{"authority_protocol":2,"action":"acquire","path":"` + path + `"}`,
 		headers:  http.Header{"Content-Type": []string{"application/json"}},
 	})
 	acquireResp := decodeLinkHandlerResp(t, acquire)
@@ -218,9 +218,27 @@ func TestLinkHandler_ReportOnlyAcceptsSignedGenericTicketWithoutReplacement(t *t
 	if link.Download == nil {
 		t.Fatal("expected acquired link ticket")
 	}
+	feedbackBody, err := json.Marshal(map[string]interface{}{
+		"authority_protocol": 2,
+		"action":             "acquire",
+		"path":               path,
+		"feedback": model.DownloadFeedback{
+			AuthorityProtocol: 2,
+			Ticket:            link.Download.Ticket,
+			Permit:            link.Download.Permit,
+			ObservationID:     link.Download.Permit.ObservationID,
+			EventType:         "failure",
+			Outcome:           "failure",
+			StatusCode:        500,
+			Reason:            "upstream failed",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal replacement request: %v", err)
+	}
 	replacement := callLinkHandler(t, linkHandlerRequest{
 		path:     path,
-		bodyJSON: `{"action":"acquire","path":"` + path + `","feedback":{"ticket":"` + link.Download.Ticket + `","event_id":"generic-failure-1","outcome":"failure","status_code":500,"reason":"upstream failed"},"exclude":["` + link.Download.Ticket + `"]}`,
+		bodyJSON: string(feedbackBody),
 		headers:  http.Header{"Content-Type": []string{"application/json"}},
 	})
 	replacementResp := decodeLinkHandlerResp(t, replacement)
@@ -235,9 +253,27 @@ func TestLinkHandler_ReportOnlyAcceptsSignedGenericTicketWithoutReplacement(t *t
 		t.Fatalf("expected generic recovery authorization to request success reporting, got %+v", replacementLink.Download)
 	}
 
+	reportBody, err := json.Marshal(map[string]interface{}{
+		"authority_protocol": 2,
+		"action":             "report",
+		"path":               path,
+		"feedback": model.DownloadFeedback{
+			AuthorityProtocol: 2,
+			Ticket:            replacementLink.Download.Ticket,
+			Permit:            replacementLink.Download.Permit,
+			ObservationID:     replacementLink.Download.Permit.ObservationID,
+			EventType:         "failure",
+			Outcome:           "failure",
+			StatusCode:        500,
+			Reason:            "upstream failed",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal report request: %v", err)
+	}
 	report := callLinkHandler(t, linkHandlerRequest{
 		path:     path,
-		bodyJSON: `{"action":"report","path":"` + path + `","feedback":{"ticket":"` + replacementLink.Download.Ticket + `","event_id":"generic-report-1","outcome":"failure","status_code":500,"reason":"upstream failed"}}`,
+		bodyJSON: string(reportBody),
 		headers:  http.Header{"Content-Type": []string{"application/json"}},
 	})
 	reportResp := decodeLinkHandlerResp(t, report)
@@ -273,9 +309,36 @@ func TestLinkHandler_RequiresExplicitAction(t *testing.T) {
 	}
 }
 
+func TestLinkAPIErrorResp_ImmutableEventConflictIsTerminal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	linkAPIErrorResp(ctx, &driverpkg.DownloadAuthorizationConflictError{
+		EventID: "event-1",
+		Reason:  "conflicting event payload",
+	})
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("expected conflict HTTP %d, got %d", http.StatusConflict, recorder.Code)
+	}
+	var response struct {
+		Code int `json:"code"`
+		Data struct {
+			AuthorityProtocol int  `json:"authority_protocol"`
+			Conflict          bool `json:"conflict"`
+			Retryable         bool `json:"retryable"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode conflict response: %v", err)
+	}
+	if response.Code != http.StatusConflict || response.Data.AuthorityProtocol != model.DownloadAuthorityProtocol || !response.Data.Conflict || response.Data.Retryable {
+		t.Fatalf("unexpected conflict response: %+v", response)
+	}
+}
+
 func TestLinkHandler_MissingPathReturnsBadRequest(t *testing.T) {
 	recorder := callLinkHandler(t, linkHandlerRequest{
-		bodyJSON: `{"action":"acquire"}`,
+		bodyJSON: `{"authority_protocol":2,"action":"acquire"}`,
 		headers:  http.Header{"Content-Type": []string{"application/json"}},
 	})
 	if recorder.Code != http.StatusBadRequest {
@@ -310,7 +373,7 @@ func TestLinkHandler_FailsClosedWhenDownloadSigningKeyIsUnavailable(t *testing.T
 	path := storage.MountPath + "/file.bin"
 	recorder := callLinkHandler(t, linkHandlerRequest{
 		path:     path,
-		bodyJSON: `{"action":"acquire","path":"` + path + `"}`,
+		bodyJSON: `{"authority_protocol":2,"action":"acquire","path":"` + path + `"}`,
 		headers:  http.Header{"Content-Type": []string{"application/json"}},
 	})
 	if recorder.Code != http.StatusInternalServerError {
@@ -327,7 +390,7 @@ func TestLinkHandler_UnavailablePoolReturnsHTTP503AndRetryAfter(t *testing.T) {
 	path := mountPath + "/file.bin"
 	recorder := callLinkHandler(t, linkHandlerRequest{
 		path:     path,
-		bodyJSON: `{"action":"acquire","path":"` + path + `"}`,
+		bodyJSON: `{"authority_protocol":2,"action":"acquire","path":"` + path + `"}`,
 		headers:  http.Header{"Content-Type": []string{"application/json"}},
 	})
 	if recorder.Code != http.StatusServiceUnavailable {
