@@ -182,3 +182,42 @@ func TestAccountStore_SharedAttachmentRejectsManualSnapshotChanges(t *testing.T)
 	_, err = attachAccountStore(context.Background(), updatedParsed, path, updatedSnapshot)
 	require.ErrorIs(t, err, errAccountStoreIdentityMismatch)
 }
+
+func TestAccountStore_AttachDuringPersistAcknowledgment(t *testing.T) {
+	initGoogleDriveTestEnv(t)
+	path := writeTempAccountsFile(t, `{"name":"account","note":"preserved","token":{"access_token":"old","refresh_token":"refresh"}}
+{"name":"account","token":{"access_token":"duplicate","refresh_token":"duplicate-refresh"}}
+`)
+	parsed, snapshot, err := parseAccountsJSON(path, Addition{})
+	require.NoError(t, err)
+	written := make(chan struct{})
+	acknowledge := make(chan struct{})
+	persist := func(path, payload string, expected []byte) ([]byte, error) {
+		next, err := persistAccountsJSONFileChecked(path, payload, expected)
+		close(written)
+		<-acknowledge
+		return next, err
+	}
+	first, err := attachAccountStoreWithHooks(context.Background(), parsed, path, persist, defaultAccountStoreBackoff, snapshot)
+	require.NoError(t, err)
+	defer func() { _ = first.shutdown(context.Background()) }()
+	first.setToken(0, `{"access_token":"new","refresh_token":"refresh"}`)
+	<-written
+	second := &GoogleDrive{
+		Addition: Addition{AccountsJSON: path},
+		modeCfg:  downloadModeConfig{Enabled: true, AccountsPath: path, SelectionPolicy: "round_robin"},
+	}
+	err = second.initAccountsJSONMode(context.Background())
+	close(acknowledge)
+	require.NoError(t, err)
+	require.Equal(t, "new", second.accounts[0].Token.AccessToken)
+	require.Len(t, second.accounts, 1)
+	require.NoError(t, second.Drop(context.Background()))
+	persisted, _, err := parseAccountsJSON(path, Addition{})
+	require.NoError(t, err)
+	require.Len(t, persisted, 2)
+	require.JSONEq(t, `{"access_token":"duplicate","refresh_token":"duplicate-refresh"}`, persisted[1].TokenJSON)
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(content), `"note":"preserved"`)
+}

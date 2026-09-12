@@ -40,6 +40,7 @@ type fileAccountStore struct {
 	persistSnapshotFn accountStorePersistFn
 	backoffFn         func(int) time.Duration
 	persistedSnapshot []byte
+	pendingSnapshot   []byte
 	stopOnce          sync.Once
 }
 
@@ -506,7 +507,7 @@ func (s *fileAccountStore) validateAttachment(initial []accountConfig, sourceSna
 	if s.closed {
 		return context.Canceled
 	}
-	if !bytes.Equal(sourceSnapshot, s.persistedSnapshot) {
+	if !bytes.Equal(sourceSnapshot, s.persistedSnapshot) && !bytes.Equal(sourceSnapshot, s.pendingSnapshot) {
 		return fmt.Errorf("%w: shared writer snapshot differs", errAccountStoreIdentityMismatch)
 	}
 	if !accountStoreLayoutsMatch(s.accounts, initial) {
@@ -699,7 +700,29 @@ func (s *fileAccountStore) persistPending(targetRev uint64) error {
 		if !bytes.Equal(actualSnapshot, expectedSnapshot) {
 			return fmt.Errorf("%w: on-disk account snapshot changed", errAccountStoreIdentityMismatch)
 		}
+		// The renamed file is visible before the writer acknowledges its revision.
+		// Attachments may observe this exact writer-owned snapshot in that window.
+		pendingPayload, err := mergePersistedAccountsJSON(expectedSnapshot, payload)
+		if err != nil {
+			return err
+		}
+		pendingSnapshot, err := semanticAccountsSnapshot([]byte(pendingPayload))
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.pendingSnapshot = pendingSnapshot
+		s.mu.Unlock()
 		acknowledgedSnapshot, err := s.persistSnapshotFn(s.path, payload, expectedSnapshot)
+		s.mu.Lock()
+		if err == nil && len(acknowledgedSnapshot) > 0 {
+			if currentRev > s.persistedRev {
+				s.persistedRev = currentRev
+			}
+			s.persistedSnapshot = append([]byte(nil), acknowledgedSnapshot...)
+		}
+		s.pendingSnapshot = nil
+		s.mu.Unlock()
 		if err != nil {
 			if errors.Is(err, errAccountStoreIdentityMismatch) {
 				return err
@@ -714,7 +737,6 @@ func (s *fileAccountStore) persistPending(targetRev uint64) error {
 		if len(acknowledgedSnapshot) == 0 {
 			return fmt.Errorf("google_drive: account persistence returned an empty snapshot acknowledgment")
 		}
-		s.markPersisted(currentRev, acknowledgedSnapshot)
 		attempt = 0
 		if targetRev > 0 {
 			_, persistedAfterWrite := s.currentRevisions()
@@ -766,15 +788,6 @@ func (s *fileAccountStore) expectedSnapshot() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return append([]byte(nil), s.persistedSnapshot...)
-}
-
-func (s *fileAccountStore) markPersisted(rev uint64, snapshot []byte) {
-	s.mu.Lock()
-	if rev > s.persistedRev {
-		s.persistedRev = rev
-	}
-	s.persistedSnapshot = append([]byte(nil), snapshot...)
-	s.mu.Unlock()
 }
 
 func marshalPersistedAccounts(accounts []accountConfig) (string, error) {
